@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "WafuRoofSet"
+version = "0.1.0"
+name = "瓦屋根セット"
+tagline = "Generate Japanese-style roofs from DXF and lay kawara roof tiles"
+maintainer = "ko-no-ma <email@example.com>"
+type = "add-on"
+
+blender_version_min = "5.1.0"
+
+license = [
+  "SPDX:GPL-2.0-or-later",
+]

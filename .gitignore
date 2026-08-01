@@ -1,0 +1,33 @@
+# Blender
+*.blend1
+*.blend2
+*.blend3
+*.blend@
+*.blend~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Packaging output
+*.zip
+dist/
+build/
+
+# 有料配布の瓦セット(サンプルは除く、GitHubには含めない)
+KawaraSet/*.blend
+!KawaraSet/kawara_sample.blend
