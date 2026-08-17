@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "WafuRoofSet"
-version = "0.1.0"
+version = "0.1.1"
 name = "瓦屋根セット"
 tagline = "Generate Japanese-style roofs from DXF and lay kawara roof tiles"
 maintainer = "ko-no-ma <email@example.com>"
