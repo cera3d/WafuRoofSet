@@ -1225,6 +1225,12 @@ def _place_ridge_end_caps(line_obj, coords, col, kawara_col):
     ridge_direction = (coords[-1] - coords[0]).normalized()
     created = []
 
+    # 同じ大棟ラインオブジェクト内で辺の選択を変えて複数の区間を順番に処理する
+    # ケースがあるため、始点・終点座標から作る一意なサフィックスを名前に含める
+    # (label(start/end)とline_obj.nameだけだと、別の区間を処理したときに同名になり、
+    # _make_point_cloud が前の区間の巴瓦・鬼瓦を削除してしまうため)。
+    suffix = _coords_ref_suffix(coords)
+
     endpoints = [
         ("start", coords[0], -ridge_direction),   # 始点では、大棟の外側(逆方向)を向く
         ("end", coords[-1], ridge_direction),      # 終点では、大棟の進行方向を向く
@@ -1245,7 +1251,7 @@ def _place_ridge_end_caps(line_obj, coords, col, kawara_col):
             # 棟瓦本体の実効開始位置(巴瓦の幅の分だけ内側)に合わせる
             # (巴瓦の終点=棟瓦本体の始点、に鬼瓦が来るように)。
             if tomoe_obj is not None:
-                obj = _make_point_cloud(f"{line_obj.name}_{label}_kawara_tomoe", [point], collection=kawara_col)
+                obj = _make_point_cloud(f"{line_obj.name}_{suffix}_{label}_kawara_tomoe", [point], collection=kawara_col)
                 _instance_on_points_with_direction(obj, tomoe_obj, facing_dir)
                 created.append(obj)
 
@@ -1256,13 +1262,13 @@ def _place_ridge_end_caps(line_obj, coords, col, kawara_col):
                 oni_point = point
 
             if oni_obj is not None:
-                obj = _make_point_cloud(f"{line_obj.name}_{label}_kawara_oni", [oni_point], collection=kawara_col)
+                obj = _make_point_cloud(f"{line_obj.name}_{suffix}_{label}_kawara_oni", [oni_point], collection=kawara_col)
                 _instance_on_points_with_direction(obj, oni_obj, facing_dir)
                 created.append(obj)
         else:
             # 隅棟収束側: 鬼瓦だけを、端点そのままに配置
             if oni_obj is not None:
-                obj = _make_point_cloud(f"{line_obj.name}_{label}_kawara_oni", [point], collection=kawara_col)
+                obj = _make_point_cloud(f"{line_obj.name}_{suffix}_{label}_kawara_oni", [point], collection=kawara_col)
                 _instance_on_points_with_direction(obj, oni_obj, facing_dir)
                 created.append(obj)
 
@@ -1441,13 +1447,20 @@ def _place_hip_end_caps(line_obj, coords, col, kawara_col):
     if len(coords) < 2:
         return []
 
+    # 同じ隅棟ラインオブジェクト内で辺の選択を変えて複数の隅(コーナー)を
+    # 順番に処理するケースがあるため、始点・終点座標から作る一意なサフィックスを
+    # 名前に含める(line_obj.name だけだと全コーナーで同名になり、
+    # _make_point_cloud が前のコーナーの巴瓦・鬼瓦を「古い同名オブジェクト」として
+    # 削除してしまい、最後に敷いたコーナーの1個しか残らなくなるため)。
+    suffix = _coords_ref_suffix(coords)
+
     point = coords[0]
     outward_dir = -(coords[1] - coords[0]).normalized()
     facing_dir = -outward_dir
 
     created = []
     if tomoe_obj is not None:
-        obj = _make_point_cloud(f"{line_obj.name}_start_kawara_hip_tomoe", [point], collection=kawara_col)
+        obj = _make_point_cloud(f"{line_obj.name}_{suffix}_start_kawara_hip_tomoe", [point], collection=kawara_col)
         _instance_on_points_with_direction(obj, tomoe_obj, facing_dir)
         created.append(obj)
 
@@ -1458,7 +1471,7 @@ def _place_hip_end_caps(line_obj, coords, col, kawara_col):
         oni_point = point
 
     if oni_obj is not None:
-        obj = _make_point_cloud(f"{line_obj.name}_start_kawara_hip_oni", [oni_point], collection=kawara_col)
+        obj = _make_point_cloud(f"{line_obj.name}_{suffix}_start_kawara_hip_oni", [oni_point], collection=kawara_col)
         _instance_on_points_with_direction(obj, oni_obj, facing_dir)
         created.append(obj)
 
