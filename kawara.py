@@ -161,34 +161,78 @@ def _extract_face_data(bm_face, mat):
     return verts, edge_is_boundary
 
 
+def _reverse_winding(verts, edge_is_boundary):
+    """頂点の並び順(面の巻き順)を反転させる。各辺の境界フラグも、反転後に
+    対応する辺へ正しく揃え直す。"""
+    n = len(verts)
+    new_verts = list(reversed(verts))
+    new_edges = [edge_is_boundary[(n - 2 - k) % n] for k in range(n)]
+    return new_verts, new_edges
+
+
+def _ensure_correct_winding(verts, edge_is_boundary):
+    """頂点の巻き順が「法線が上向きになる」向きに揃うようにする。
+
+    手動モデリングした屋根面は、面全体の頂点の並び順自体が逆(時計回り)に
+    なっていることがある。この場合、_get_face_frame() 側で法線のZ成分だけを
+    反転させても、x_axis(軒先の向き)は頂点の並び順(verts[1]-verts[0])から
+    決まるため逆向きのままになってしまう。法線だけでなくx_axisも逆になると、
+    瓦を敷く座標系全体が本来の向きに対して鏡像(ミラー)になり、瓦タイルの
+    重なり方向(左右非対称な形状)が噛み合わなくなる。
+    そのため、法線の向きだけでなく頂点の並び順そのものをここで反転させる
+    ことで、x_axis・法線の両方が一貫して正しい向きになるようにする。
+    """
+    n = len(verts)
+    if n < 3:
+        return verts, edge_is_boundary
+    normal = Vector((0.0, 0.0, 0.0))
+    for i in range(n):
+        v_curr = verts[i]
+        v_next = verts[(i + 1) % n]
+        normal.x += (v_curr.y - v_next.y) * (v_curr.z + v_next.z)
+        normal.y += (v_curr.z - v_next.z) * (v_curr.x + v_next.x)
+        normal.z += (v_curr.x - v_next.x) * (v_curr.y + v_next.y)
+    if normal.z < 0:
+        verts, edge_is_boundary = _reverse_winding(verts, edge_is_boundary)
+    return verts, edge_is_boundary
+
+
 def _get_face_verts(face_obj):
     """対象オブジェクトから、屋根面を構成する頂点(ワールド座標、軒先が先頭に来るよう
     並べ替え済み)、face_index(そのオブジェクト内での面インデックス。オブジェクト全体を
-    1面として扱った場合はNone)、各辺が境界(他の面と共有されていない)かどうかのリストを返す。
-    編集モードで面を1つ選択している場合はその面だけを使い(複数面が1つのメッシュに
-    まとまっているオブジェクトからでも、必要な面だけを取り出せる)、
-    それ以外の場合は従来通りメッシュ全体の頂点を1つの面として扱う。
+    1面として扱った場合はNone)、各辺が境界(他の面と共有されていない)かどうかのリストを、
+    対象の面ごとに独立して求め、そのリストを返す。
+    編集モードで複数の面を選択している場合、選択されている面それぞれを完全に独立した
+    屋根面として扱う(1面ずつ選び直して実行した場合と同じ結果になるようにするため。
+    棟・隅棟ラインの複数選択対応や屋根面オブジェクトの複数選択対応と同じ考え方)。
+    以前は編集モードで面がちょうど1つ選択されている場合のみ許可していたが、
+    複数選択時にエラーになってしまう不具合があったため、選択されているものは
+    全部、それぞれ独立に処理するようにした。
+    編集モードでない場合は、従来通りメッシュ全体を1つの面として扱う。
+    戻り値: [(verts, face_index, edge_is_boundary), ...]
+    (編集モードなら選択されている面の数だけ、それ以外なら要素1つ)
     """
     mat = face_obj.matrix_world
 
     if face_obj.mode == 'EDIT':
         bm = bmesh.from_edit_mesh(face_obj.data)
         selected_faces = [f for f in bm.faces if f.select]
-        if len(selected_faces) != 1:
-            raise ValueError(
-                f"編集モードでは、対象の面をちょうど1つだけ選択してください"
-                f"(現在{len(selected_faces)}個選択されています)。"
-            )
-        target_face = selected_faces[0]
-        verts, edge_is_boundary = _extract_face_data(target_face, mat)
-        verts, edge_is_boundary = _reorder_eave_first(verts, edge_is_boundary)
-        return verts, target_face.index, edge_is_boundary
+        if not selected_faces:
+            raise ValueError("編集モードでは、対象の面を選択してください。")
+        results = []
+        for target_face in selected_faces:
+            verts, edge_is_boundary = _extract_face_data(target_face, mat)
+            verts, edge_is_boundary = _ensure_correct_winding(verts, edge_is_boundary)
+            verts, edge_is_boundary = _reorder_eave_first(verts, edge_is_boundary)
+            results.append((verts, target_face.index, edge_is_boundary))
+        return results
 
     mesh = face_obj.data
     verts = [mat @ v.co for v in mesh.vertices]
     edge_is_boundary = [True] * len(verts)
+    verts, edge_is_boundary = _ensure_correct_winding(verts, edge_is_boundary)
     verts, edge_is_boundary = _reorder_eave_first(verts, edge_is_boundary)
-    return verts, None, edge_is_boundary
+    return [(verts, None, edge_is_boundary)]
 
 
 def _get_face_verts_by_index(face_obj, face_index):
@@ -246,42 +290,61 @@ def _get_face_verts_for_tile(tile_obj):
 
 def _get_face_frame(face_obj):
     """対象オブジェクトが3頂点以上の平面(矩形・三角形・台形など)であることを前提に、
-    原点・横軸・縦軸(勾配方向)・法線・幅・流れ長さ・局所2D座標(点群フィルタ用)を求める。
+    原点・横軸・縦軸(勾配方向)・法線・幅・流れ長さ・局所2D座標(点群フィルタ用)を、
+    対象の面ごとに独立して求める。
     軒側の辺は verts[0]→verts[1] と仮定する(既にZが一番低い辺が先頭に来るよう
     並べ替え済み)。
+    _get_face_verts と同じく、編集モードで複数の面を選択している場合はそれぞれ
+    独立したフレームを計算し、リストで返す。
+    戻り値: [(origin, x_axis, y_axis, normal, width, slope_len, local_coords,
+              face_index, edge_is_boundary), ...]
     """
-    verts, face_index, edge_is_boundary = _get_face_verts(face_obj)
-    n = len(verts)
+    frames = []
+    for verts, face_index, edge_is_boundary in _get_face_verts(face_obj):
+        n = len(verts)
 
-    if n < 3:
-        raise ValueError("対象オブジェクトは3頂点以上の平面である必要があります。")
+        if n < 3:
+            raise ValueError("対象オブジェクトは3頂点以上の平面である必要があります。")
 
-    origin = verts[0]
-    x_axis = (verts[1] - verts[0]).normalized()
+        origin = verts[0]
+        x_axis = (verts[1] - verts[0]).normalized()
 
-    # Newellの方法で法線を求める(3頂点超の面でも安定)
-    normal = Vector((0.0, 0.0, 0.0))
-    for i in range(n):
-        v_curr = verts[i]
-        v_next = verts[(i + 1) % n]
-        normal.x += (v_curr.y - v_next.y) * (v_curr.z + v_next.z)
-        normal.y += (v_curr.z - v_next.z) * (v_curr.x + v_next.x)
-        normal.z += (v_curr.x - v_next.x) * (v_curr.y + v_next.y)
-    normal.normalize()
+        # Newellの方法で法線を求める(3頂点超の面でも安定)
+        normal = Vector((0.0, 0.0, 0.0))
+        for i in range(n):
+            v_curr = verts[i]
+            v_next = verts[(i + 1) % n]
+            normal.x += (v_curr.y - v_next.y) * (v_curr.z + v_next.z)
+            normal.y += (v_curr.z - v_next.z) * (v_curr.x + v_next.x)
+            normal.z += (v_curr.x - v_next.x) * (v_curr.y + v_next.y)
+        normal.normalize()
 
-    y_axis = normal.cross(x_axis).normalized()
+        # 屋根面は現実的にはほぼ必ず「上向き」(法線のZ成分がプラス)のはずなので、
+        # メッシュの頂点順序(法線)が逆になっていた場合はここで反転させる。
+        # メッシュ自体は一切書き換えず、この関数内で使う計算結果だけを直しているので、
+        # 手動でユーザーが法線を直した/直していないに関わらず、常に安全に効く
+        # (以前試した「メッシュ全体の法線をbmeshで強制的に再計算する」方式は、
+        # 屋根のような閉じていない形状だと「外向き」の判定自体を誤ることがあり、
+        # かつメッシュを書き換えてしまうため、ユーザーの手動修正を壊す副作用が
+        # あった。この方式ではその問題が起きない)。
+        if normal.z < 0:
+            normal = -normal
 
-    local_coords = []
-    for v in verts:
-        rel = v - origin
-        local_coords.append((rel.dot(x_axis), rel.dot(y_axis)))
+        y_axis = normal.cross(x_axis).normalized()
 
-    us = [c[0] for c in local_coords]
-    ws = [c[1] for c in local_coords]
-    width = max(us) - min(us)
-    slope_len = max(ws) - min(ws)
+        local_coords = []
+        for v in verts:
+            rel = v - origin
+            local_coords.append((rel.dot(x_axis), rel.dot(y_axis)))
 
-    return origin, x_axis, y_axis, normal, width, slope_len, local_coords, face_index, edge_is_boundary
+        us = [c[0] for c in local_coords]
+        ws = [c[1] for c in local_coords]
+        width = max(us) - min(us)
+        slope_len = max(ws) - min(ws)
+
+        frames.append((origin, x_axis, y_axis, normal, width, slope_len, local_coords, face_index, edge_is_boundary))
+
+    return frames
 
 
 def _rotation_euler(x_axis, y_axis, normal):
@@ -480,6 +543,9 @@ def _fit_pitch(length, base_pitch, tolerance, tile_width=None):
 def lay_flat_tiles(face_obj, col):
     """屋根面(平面ポリゴン)に、平瓦だけを隙間なく・はみ出さず敷く。
     軒瓦・袖瓦・棟瓦はここでは一切扱わない(それぞれ別関数で、線に沿って独立に敷く)。
+    編集モードで複数の面を選択している場合は、選択されているすべての面に対して
+    それぞれ独立に(1面ずつ選び直して実行した場合と同じ結果になるように)処理し、
+    結果をまとめて返す。
     """
     from shapely.geometry import Polygon, Point
 
@@ -489,189 +555,195 @@ def lay_flat_tiles(face_obj, col):
     if flat_obj is None:
         raise ValueError("コレクション内に「平」瓦が見つかりません。")
 
-    origin, x_axis, y_axis, normal, width, slope_len, local_coords, face_index, edge_is_boundary = _get_face_frame(face_obj)
-    euler = _rotation_euler(x_axis, y_axis, normal)
-
-    base_pitch_x = spec.hataraki_haba / 1000.0  # mm -> m
-    pitch_y = spec.hataraki_nagasa / 1000.0  # mm -> m
-    tolerance = spec.chousei_sunpo / 1000.0  # mm -> m
-
-    # 袖瓦が「かぶせ」ではなく「敷く」タイプ(万十など)の場合、
-    # 袖瓦オブジェクト自身に記録された kawara_flat_offset_mm の分だけ、
-    # 平瓦・軒瓦のグリッド基準点を内側にずらす(袖瓦と1枚目が重ならないようにするため)。
-    # 属性が無い(かぶせタイプ、または未設定)場合は 0 のまま、従来通り動作する。
-    # 基準(u=0)はケラバそのもの。オフセットがあればケラバからオフセット分内側から
-    # 敷き始める(ケラバの出があっても、袖瓦がある側はそちらが実際の出際を
-    # 担っているので、この基準点自体はケラバの出の影響を受けない)。
     verge_left_obj = roles.get("verge_left")
     verge_right_obj = roles.get("verge_right")
-    # 袖瓦オブジェクトがセットにあっても、この面のその辺自体が境界(ケラバ)でなければ
-    # (=隅棟などで他の面と繋がっていて袖瓦が敷かれない辺なら)、オフセットは適用しない。
-    n_verts = len(local_coords)
-    left_is_boundary = edge_is_boundary[(n_verts - 1) % n_verts]
-    right_is_boundary = edge_is_boundary[1 % n_verts]
 
-    # 隅棟など境界でない辺が、軒先から棟にかけて外側(面の外側)へ広がっている場合、
-    # ケラバのオーバーハングと同じ考え方で、その辺だけ瓦1枚分(ベースのピッチ分)
-    # 外側に張り出した「仮想の面」を一時的に想定して、以降の配置計算(幅・ポリゴン・
-    # グリッド範囲すべて)をその仮想の面基準で行う。実際のメッシュは一切変更せず、
-    # ここで作るのはあくまで配置計算専用のローカル座標のコピー。
-    # 判定は、その辺の傾き(du/dw)だけで行うので、頂点の並び順や左右がどちらを
-    # 向いていても正しく働く。
-    local_coords = list(local_coords)
-    widening_left = False
-    widening_right = False
-    if not left_is_boundary:
-        idx_last = (n_verts - 1) % n_verts
-        u_top, w_top = local_coords[idx_last]
-        if w_top > 1e-6 and u_top < -1e-6:
-            widening_left = True
-            local_coords[idx_last] = (u_top - base_pitch_x, w_top)
-    if not right_is_boundary:
-        idx1 = 1 % n_verts
-        idx2 = 2 % n_verts
-        u1, w1 = local_coords[idx1]
-        u2, w2 = local_coords[idx2]
-        if (w2 - w1) > 1e-6 and (u2 - u1) > 1e-6:
-            widening_right = True
-            local_coords[idx1] = (u1 + base_pitch_x, w1)
-            local_coords[idx2] = (u2 + base_pitch_x, w2)
-    if widening_left or widening_right:
-        us_tmp = [c[0] for c in local_coords]
-        width = max(us_tmp) - min(us_tmp)
+    all_created = []
+    total_count = 0
 
-    left_offset = (verge_left_obj.get("kawara_flat_offset_mm", 0.0) / 1000.0) if (verge_left_obj is not None and left_is_boundary) else 0.0
-    right_offset = (verge_right_obj.get("kawara_flat_offset_mm", 0.0) / 1000.0) if (verge_right_obj is not None and right_is_boundary) else 0.0
+    for origin, x_axis, y_axis, normal, width, slope_len, local_coords, face_index, edge_is_boundary in _get_face_frame(face_obj):
+        euler = _rotation_euler(x_axis, y_axis, normal)
 
-    # ケラバの出(kerava_overhang)・軒の出(eave_overhang): 割付計算(何枚敷けるか)
-    # では、屋根面の幅に、ケラバの出を左右2か所分足した「仮想屋根面」の幅を使う。
-    # 最後の1枚は次の瓦にかぶせてもらえない分、瓦自体の実寸(tile_width)がそのまま
-    # 必要になる(_fit_pitchのtile_width引数が担う)。基準点(1枚目の位置)は
-    # 袖瓦オフセットのみで決まり、ケラバの出はここでは差し引かない。
-    kerava_overhang = spec.kerava_overhang / 1000.0
-    eave_overhang = spec.eave_overhang / 1000.0
+        base_pitch_x = spec.hataraki_haba / 1000.0  # mm -> m
+        pitch_y = spec.hataraki_nagasa / 1000.0  # mm -> m
+        tolerance = spec.chousei_sunpo / 1000.0  # mm -> m
 
-    effective_width = max(width + 2 * kerava_overhang - left_offset, 1e-6)
-    tile_width_mm = flat_obj.get("kawara_tile_width_mm")
-    tile_width = (tile_width_mm / 1000.0) if tile_width_mm is not None else None
-    n_x, pitch_x = _fit_pitch(effective_width, base_pitch_x, tolerance, tile_width=tile_width)
+        # 袖瓦が「かぶせ」ではなく「敷く」タイプ(万十など)の場合、
+        # 袖瓦オブジェクト自身に記録された kawara_flat_offset_mm の分だけ、
+        # 平瓦・軒瓦のグリッド基準点を内側にずらす(袖瓦と1枚目が重ならないようにするため)。
+        # 属性が無い(かぶせタイプ、または未設定)場合は 0 のまま、従来通り動作する。
+        # 基準(u=0)はケラバそのもの。オフセットがあればケラバからオフセット分内側から
+        # 敷き始める(ケラバの出があっても、袖瓦がある側はそちらが実際の出際を
+        # 担っているので、この基準点自体はケラバの出の影響を受けない)。
+        # 袖瓦オブジェクトがセットにあっても、この面のその辺自体が境界(ケラバ)でなければ
+        # (=隅棟などで他の面と繋がっていて袖瓦が敷かれない辺なら)、オフセットは適用しない。
+        n_verts = len(local_coords)
+        left_is_boundary = edge_is_boundary[(n_verts - 1) % n_verts]
+        right_is_boundary = edge_is_boundary[1 % n_verts]
 
-    us = [c[0] for c in local_coords]
-    ws = [c[1] for c in local_coords]
-    u_min, u_max = min(us), max(us)
-    w_min, w_max = min(ws), max(ws)
+        # 隅棟など境界でない辺が、軒先から棟にかけて外側(面の外側)へ広がっている場合、
+        # ケラバのオーバーハングと同じ考え方で、その辺だけ瓦1枚分(ベースのピッチ分)
+        # 外側に張り出した「仮想の面」を一時的に想定して、以降の配置計算(幅・ポリゴン・
+        # グリッド範囲すべて)をその仮想の面基準で行う。実際のメッシュは一切変更せず、
+        # ここで作るのはあくまで配置計算専用のローカル座標のコピー。
+        # 判定は、その辺の傾き(du/dw)だけで行うので、頂点の並び順や左右がどちらを
+        # 向いていても正しく働く。
+        local_coords = list(local_coords)
+        widening_left = False
+        widening_right = False
+        if not left_is_boundary:
+            idx_last = (n_verts - 1) % n_verts
+            u_top, w_top = local_coords[idx_last]
+            if w_top > 1e-6 and u_top < -1e-6:
+                widening_left = True
+                local_coords[idx_last] = (u_top - base_pitch_x, w_top)
+        if not right_is_boundary:
+            idx1 = 1 % n_verts
+            idx2 = 2 % n_verts
+            u1, w1 = local_coords[idx1]
+            u2, w2 = local_coords[idx2]
+            if (w2 - w1) > 1e-6 and (u2 - u1) > 1e-6:
+                widening_right = True
+                local_coords[idx1] = (u1 + base_pitch_x, w1)
+                local_coords[idx2] = (u2 + base_pitch_x, w2)
+        if widening_left or widening_right:
+            us_tmp = [c[0] for c in local_coords]
+            width = max(us_tmp) - min(us_tmp)
 
-    poly = Polygon(local_coords)
-    if not poly.is_valid:
-        poly = poly.buffer(0)
-    # 仮想屋根面: 割付判定用のバッファは、ピッチの半分と、ケラバの出・軒の出の
-    # うち大きい方を比べて、より大きい方を使う(狭い場所での取りこぼし防止に
-    # 加えて、ケラバ・軒の出の分まで判定範囲を広げるため)。
-    margin = max(min(pitch_x, pitch_y) * 0.5, kerava_overhang, eave_overhang)
-    poly_check = poly.buffer(margin)
-    # 隅棟などケラバでない辺(面がその方向に広がったり狭まったりする辺)専用の、
-    # より大きい(1ピッチ分)判定バッファ。急な隅棟の角度だと通常のバッファ(半ピッチ)
-    # だけでは境界ぎりぎりの1枚を取りこぼすことがあるため。ただしこのバッファは、
-    # 「ケラバでない辺の外側にはみ出した候補」にだけ適用し(下のループ内で使用)、
-    # 軒先・棟・ケラバ側の判定には一切影響させない(軒瓦の行の判定などに
-    # 副作用が出ないようにするため)。
-    poly_check_hip = poly.buffer(pitch_x) if not (left_is_boundary and right_is_boundary) else None
+        left_offset = (verge_left_obj.get("kawara_flat_offset_mm", 0.0) / 1000.0) if (verge_left_obj is not None and left_is_boundary) else 0.0
+        right_offset = (verge_right_obj.get("kawara_flat_offset_mm", 0.0) / 1000.0) if (verge_right_obj is not None and right_is_boundary) else 0.0
 
-    chidori = bool(getattr(spec, "chidori", False))
-    # 千鳥敷きの場合、ずらした行は境界の外側(半ピッチ分)まで格子点が要るため、
-    # 探索範囲を1列分余分に広げておく。
-    i_margin = 2 if chidori else 1
-    i_start = math.floor((u_min - kerava_overhang) / pitch_x) - i_margin
-    i_end = math.ceil((u_max + kerava_overhang) / pitch_x) + i_margin
-    j_start = math.floor((w_min - eave_overhang) / pitch_y) - 1
-    j_end = math.ceil(w_max / pitch_y) + 1
+        # ケラバの出(kerava_overhang)・軒の出(eave_overhang): 割付計算(何枚敷けるか)
+        # では、屋根面の幅に、ケラバの出を左右2か所分足した「仮想屋根面」の幅を使う。
+        # 最後の1枚は次の瓦にかぶせてもらえない分、瓦自体の実寸(tile_width)がそのまま
+        # 必要になる(_fit_pitchのtile_width引数が担う)。基準点(1枚目の位置)は
+        # 袖瓦オフセットのみで決まり、ケラバの出はここでは差し引かない。
+        kerava_overhang = spec.kerava_overhang / 1000.0
+        eave_overhang = spec.eave_overhang / 1000.0
 
-    roles = find_role_objects(col)
-    has_eave = roles.get("eave") is not None and edge_is_boundary[0]
+        effective_width = max(width + 2 * kerava_overhang - left_offset, 1e-6)
+        tile_width_mm = flat_obj.get("kawara_tile_width_mm")
+        tile_width = (tile_width_mm / 1000.0) if tile_width_mm is not None else None
+        n_x, pitch_x = _fit_pitch(effective_width, base_pitch_x, tolerance, tile_width=tile_width)
 
-    right_bound = width - right_offset
+        us = [c[0] for c in local_coords]
+        ws = [c[1] for c in local_coords]
+        u_min, u_max = min(us), max(us)
+        w_min, w_max = min(ws), max(ws)
 
-    valid_j = []
-    candidates = []
-    for j in range(j_start, j_end + 1):
-        # 千鳥敷き: 偶数段だけ半ピッチ分マイナス側(ケラバの外側)にずらす。
-        # はみ出た分は境界チェックでは弾かず、後の「はみ出た平瓦をカット」で
-        # ケラバの実際の輪郭に合わせて切り落とす前提。
-        # 軒に一番近い行(j=0相当)は基準通り、その次の行から半ピッチずつ交互にずらす
-        row_shift = (pitch_x / 2.0) if (chidori and j % 2 == 1) else 0.0
-        row_has_point = False
-        for i in range(i_start, i_end + 1):
-            u = left_offset - row_shift + i * pitch_x
-            w = j * pitch_y
-            if not chidori:
-                # 袖瓦(敷くタイプ)が確保している範囲(左端・右端のオフセット分)には、
-                # 平瓦の格子点を置かない
-                # 左右の上限・下限は、その辺が実際にケラバ(境界)である場合にのみ適用する。
-                # 隅棟などケラバでない辺は、面の形自体が行ごとに広がったり狭まったり
-                # するため、固定のleft_offset/right_boundで切ってしまうと、その広がりに
-                # 平瓦が追従できなくなる(poly_checkによる面形状の判定だけに任せる)。
-                if left_is_boundary and u < left_offset - 1e-6:
-                    continue
-                if right_is_boundary and u > right_bound + 1e-6:
-                    continue
-                # _fit_pitch が計算した枚数(n_x)を、境界チェックとは別に、明示的な上限として使う。
-                # (ピッチが詰まる方向に調整された場合、境界チェックだけだと、理論値より
-                # 1枚多く入ってしまうことがあるため)
-                # _fit_pitch が計算した枚数(n_x)による上限も、同じ理由でケラバ側のみに適用する。
-                if left_is_boundary and i < 0:
-                    continue
-                if right_is_boundary and i > n_x - 1:
-                    continue
-            else:
-                # 千鳥のずれた行は、境界を半ピッチ分はみ出すところまで許容する
-                # (n_xによる上限チェックも行わない。はみ出しはカット工程に任せる)。
-                if left_is_boundary and u < left_offset - pitch_x - 1e-6:
-                    continue
-                if right_is_boundary and u > right_bound + pitch_x + 1e-6:
-                    continue
-            point = Point(u, w)
-            accept = poly_check.contains(point)
-            if not accept and poly_check_hip is not None and not chidori:
-                # ケラバでない辺の外側(通常の判定だと弾かれる範囲)に限って、
-                # より広いバッファ(1ピッチ分)で再判定する。
-                beyond_left = (not left_is_boundary) and u < left_offset - 1e-6
-                beyond_right = (not right_is_boundary) and u > right_bound + 1e-6
-                if (beyond_left or beyond_right) and poly_check_hip.contains(point):
-                    accept = True
-            if accept:
-                candidates.append((i, j, u, w))
-                row_has_point = True
-        if row_has_point:
-            valid_j.append(j)
+        poly = Polygon(local_coords)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        # 仮想屋根面: 割付判定用のバッファは、ピッチの半分と、ケラバの出・軒の出の
+        # うち大きい方を比べて、より大きい方を使う(狭い場所での取りこぼし防止に
+        # 加えて、ケラバ・軒の出の分まで判定範囲を広げるため)。
+        margin = max(min(pitch_x, pitch_y) * 0.5, kerava_overhang, eave_overhang)
+        poly_check = poly.buffer(margin)
+        # 隅棟などケラバでない辺(面がその方向に広がったり狭まったりする辺)専用の、
+        # より大きい(1ピッチ分)判定バッファ。急な隅棟の角度だと通常のバッファ(半ピッチ)
+        # だけでは境界ぎりぎりの1枚を取りこぼすことがあるため。ただしこのバッファは、
+        # 「ケラバでない辺の外側にはみ出した候補」にだけ適用し(下のループ内で使用)、
+        # 軒先・棟・ケラバ側の判定には一切影響させない(軒瓦の行の判定などに
+        # 副作用が出ないようにするため)。
+        poly_check_hip = poly.buffer(pitch_x) if not (left_is_boundary and right_is_boundary) else None
 
-    if not candidates:
-        raise ValueError("面の範囲内にタイルを1枚も配置できませんでした。面の寸法とピッチを確認してください。")
+        chidori = bool(getattr(spec, "chidori", False))
+        # 千鳥敷きの場合、ずらした行は境界の外側(半ピッチ分)まで格子点が要るため、
+        # 探索範囲を1列分余分に広げておく。
+        i_margin = 2 if chidori else 1
+        i_start = math.floor((u_min - kerava_overhang) / pitch_x) - i_margin
+        i_end = math.ceil((u_max + kerava_overhang) / pitch_x) + i_margin
+        j_start = math.floor((w_min - eave_overhang) / pitch_y) - 1
+        j_end = math.ceil(w_max / pitch_y) + 1
 
-    j_min_used = min(valid_j)
-    flat_pts = [
-        origin + x_axis * u + y_axis * w
-        for i, j, u, w in candidates
-        # 軒瓦がある場合に平瓦を避けるべき行は、常に軒先そのもの(w=0、つまりj==0)を
-        # 必ず含めて除外する。隅棟側で候補探索のバッファを広げた影響で、本来は存在
-        # しない軒の外側の行(j<0)が候補に紛れ込み、それがj_min_usedになってしまうと、
-        # 本来除外すべき本物の軒先の行(j==0)がそのまま残ってしまい、軒瓦と平瓦が
-        # 二重に敷かれてしまうため。
-        if not (has_eave and (j == 0 or j == j_min_used))
-    ]
+        has_eave = roles.get("eave") is not None and edge_is_boundary[0]
 
-    if not flat_pts:
-        raise ValueError("面の範囲内にタイルを1枚も配置できませんでした。面の寸法とピッチを確認してください。")
+        right_bound = width - right_offset
 
-    name_suffix = _face_ref_suffix(face_obj, face_index)
-    kawara_col = _get_or_create_kawara_collection(face_obj)
-    pts_obj = _make_point_cloud(f"{name_suffix}_kawara_flat", flat_pts, collection=kawara_col)
-    _instance_on_points(pts_obj, flat_obj, euler)
-    _tag_face_reference(pts_obj, face_obj, face_index, "flat")
-    pts_obj["kawara_pitch_x_mm"] = pitch_x * 1000.0
-    pts_obj["kawara_pitch_y_mm"] = pitch_y * 1000.0
-    _set_parent_keep_transform(pts_obj, face_obj)
+        valid_j = []
+        candidates = []
+        for j in range(j_start, j_end + 1):
+            # 千鳥敷き: 偶数段だけ半ピッチ分マイナス側(ケラバの外側)にずらす。
+            # はみ出た分は境界チェックでは弾かず、後の「はみ出た平瓦をカット」で
+            # ケラバの実際の輪郭に合わせて切り落とす前提。
+            # 軒に一番近い行(j=0相当)は基準通り、その次の行から半ピッチずつ交互にずらす
+            row_shift = (pitch_x / 2.0) if (chidori and j % 2 == 1) else 0.0
+            row_has_point = False
+            for i in range(i_start, i_end + 1):
+                u = left_offset - row_shift + i * pitch_x
+                w = j * pitch_y
+                if not chidori:
+                    # 袖瓦(敷くタイプ)が確保している範囲(左端・右端のオフセット分)には、
+                    # 平瓦の格子点を置かない
+                    # 左右の上限・下限は、その辺が実際にケラバ(境界)である場合にのみ適用する。
+                    # 隅棟などケラバでない辺は、面の形自体が行ごとに広がったり狭まったり
+                    # するため、固定のleft_offset/right_boundで切ってしまうと、その広がりに
+                    # 平瓦が追従できなくなる(poly_checkによる面形状の判定だけに任せる)。
+                    if left_is_boundary and u < left_offset - 1e-6:
+                        continue
+                    if right_is_boundary and u > right_bound + 1e-6:
+                        continue
+                    # _fit_pitch が計算した枚数(n_x)を、境界チェックとは別に、明示的な上限として使う。
+                    # (ピッチが詰まる方向に調整された場合、境界チェックだけだと、理論値より
+                    # 1枚多く入ってしまうことがあるため)
+                    # _fit_pitch が計算した枚数(n_x)による上限も、同じ理由でケラバ側のみに適用する。
+                    if left_is_boundary and i < 0:
+                        continue
+                    if right_is_boundary and i > n_x - 1:
+                        continue
+                else:
+                    # 千鳥のずれた行は、境界を半ピッチ分はみ出すところまで許容する
+                    # (n_xによる上限チェックも行わない。はみ出しはカット工程に任せる)。
+                    if left_is_boundary and u < left_offset - pitch_x - 1e-6:
+                        continue
+                    if right_is_boundary and u > right_bound + pitch_x + 1e-6:
+                        continue
+                point = Point(u, w)
+                accept = poly_check.contains(point)
+                if not accept and poly_check_hip is not None and not chidori:
+                    # ケラバでない辺の外側(通常の判定だと弾かれる範囲)に限って、
+                    # より広いバッファ(1ピッチ分)で再判定する。
+                    beyond_left = (not left_is_boundary) and u < left_offset - 1e-6
+                    beyond_right = (not right_is_boundary) and u > right_bound + 1e-6
+                    if (beyond_left or beyond_right) and poly_check_hip.contains(point):
+                        accept = True
+                if accept:
+                    candidates.append((i, j, u, w))
+                    row_has_point = True
+            if row_has_point:
+                valid_j.append(j)
 
-    return [pts_obj], len(flat_pts)
+        if not candidates:
+            raise ValueError("面の範囲内にタイルを1枚も配置できませんでした。面の寸法とピッチを確認してください。")
+
+        j_min_used = min(valid_j)
+        flat_pts = [
+            origin + x_axis * u + y_axis * w
+            for i, j, u, w in candidates
+            # 軒瓦がある場合に平瓦を避けるべき行は、常に軒先そのもの(w=0、つまりj==0)を
+            # 必ず含めて除外する。隅棟側で候補探索のバッファを広げた影響で、本来は存在
+            # しない軒の外側の行(j<0)が候補に紛れ込み、それがj_min_usedになってしまうと、
+            # 本来除外すべき本物の軒先の行(j==0)がそのまま残ってしまい、軒瓦と平瓦が
+            # 二重に敷かれてしまうため。
+            if not (has_eave and (j == 0 or j == j_min_used))
+        ]
+
+        if not flat_pts:
+            raise ValueError("面の範囲内にタイルを1枚も配置できませんでした。面の寸法とピッチを確認してください。")
+
+        name_suffix = _face_ref_suffix(face_obj, face_index)
+        kawara_col = _get_or_create_kawara_collection(face_obj)
+        pts_obj = _make_point_cloud(f"{name_suffix}_kawara_flat", flat_pts, collection=kawara_col)
+        _instance_on_points(pts_obj, flat_obj, euler)
+        _tag_face_reference(pts_obj, face_obj, face_index, "flat")
+        pts_obj["kawara_pitch_x_mm"] = pitch_x * 1000.0
+        pts_obj["kawara_pitch_y_mm"] = pitch_y * 1000.0
+        _set_parent_keep_transform(pts_obj, face_obj)
+
+        all_created.append(pts_obj)
+        total_count += len(flat_pts)
+
+    return all_created, total_count
 
 
 # ---------------------------------------------------------------------------
@@ -939,86 +1011,91 @@ def lay_eave_tiles(face_obj, col, offset_x=None):
     回転は屋根面の傾きに合わせる(ラインの向きだけでは勾配が反映されないため)。
     offset_x: 平瓦と揃えるための横方向オフセット(m)。Noneの場合、袖瓦の
     kawara_flat_offset_mm属性から自動計算する(平瓦と同じ考え方)。
+    編集モードで複数の面を選択している場合は、それぞれの面について独立に処理する。
     """
     roles = find_role_objects(col)
     eave_obj = roles.get("eave")
     if eave_obj is None:
         return [], 0
 
-    origin, x_axis, y_axis, normal, width, slope_len, local_coords, face_index, edge_is_boundary = _get_face_frame(face_obj)
-
-    if not edge_is_boundary[0]:
-        return [], 0
-
-    verts, _, _edge_bnd = _get_face_verts(face_obj)
-
     spec = bpy.context.scene.kawara_working_spec
-
-    # 袖瓦(敷くタイプ)の場合、平瓦と同じオフセットを軒瓦にも適用する。
-    # 基準(u=0)はケラバそのもの、オフセットがあればそこから内側から敷き始める
-    # (平瓦と同じ考え方。ケラバの出自体は割付計算にのみ使うもので、ここでは
-    # 軒瓦のライン上には敷く枚数・位置に影響しない)。
     verge_left_obj = roles.get("verge_left")
     verge_right_obj = roles.get("verge_right")
-    # 平瓦と同様、この面のその辺自体が境界(ケラバ)でなければオフセットは適用しない。
-    n_verts = len(local_coords)
-    left_is_boundary = edge_is_boundary[(n_verts - 1) % n_verts]
-    right_is_boundary = edge_is_boundary[1 % n_verts]
-    left_offset = (verge_left_obj.get("kawara_flat_offset_mm", 0.0) / 1000.0) if (verge_left_obj is not None and left_is_boundary) else 0.0
-    right_offset = (verge_right_obj.get("kawara_flat_offset_mm", 0.0) / 1000.0) if (verge_right_obj is not None and right_is_boundary) else 0.0
-    if offset_x is None:
-        offset_x = left_offset
 
-    # 平瓦と同じ考え方: 隅棟など境界でない辺が軒先から棟にかけて外側へ広がって
-    # いる場合、その辺が軒先と交わる側の端点を、瓦1枚分(ベースのピッチ分)だけ
-    # 外側に仮想的に伸ばしてから軒瓦のラインを敷く(実際のメッシュ・頂点は
-    # 一切変更しない)。平瓦側は軒に一番近い段を軒瓦に譲る仕組みになっているため、
-    # 軒瓦がここまで追従しないと、隅棟の軒側だけ隙間が残ってしまう。
-    base_pitch_eave = spec.hataraki_haba / 1000.0
-    extend_left = 0.0
-    extend_right = 0.0
-    if not left_is_boundary:
-        idx_last = (n_verts - 1) % n_verts
-        u_top, w_top = local_coords[idx_last]
-        if w_top > 1e-6 and u_top < -1e-6:
-            extend_left = base_pitch_eave
-    if not right_is_boundary:
-        idx1 = 1 % n_verts
-        idx2 = 2 % n_verts
-        u1, w1 = local_coords[idx1]
-        u2, w2 = local_coords[idx2]
-        if (w2 - w1) > 1e-6 and (u2 - u1) > 1e-6:
-            extend_right = base_pitch_eave
+    all_created = []
+    total_count = 0
 
-    coords = [
-        verts[0] - x_axis * extend_left + x_axis * offset_x,
-        verts[1] + x_axis * extend_right - x_axis * right_offset,
-    ]
-    euler = _rotation_euler(x_axis, y_axis, normal)
+    for (origin, x_axis, y_axis, normal, width, slope_len, local_coords, face_index, edge_is_boundary), (verts, _face_index_v, _edge_bnd) in zip(_get_face_frame(face_obj), _get_face_verts(face_obj)):
+        if not edge_is_boundary[0]:
+            continue
 
-    # ケラバの出(kerava_overhang): 平瓦と同じ考え方で、割付計算(何枚敷けるか)に
-    # だけ使う。屋根面の幅に、ケラバの出を左右2か所分足した「仮想屋根面」の
-    # 幅を使って枚数・ピッチを決める(基準点自体はオフセットのみで決まる)。
-    kerava_overhang = spec.kerava_overhang / 1000.0
-    edge_width = max((verts[1] - verts[0]).length + extend_left + extend_right + 2 * kerava_overhang - left_offset, 1e-6)
-    tile_width_mm = eave_obj.get("kawara_tile_width_mm")
-    tile_width = (tile_width_mm / 1000.0) if tile_width_mm is not None else None
-    _, pitch = _fit_pitch(edge_width, spec.hataraki_haba / 1000.0, spec.chousei_sunpo / 1000.0, tile_width=tile_width)
+        # 袖瓦(敷くタイプ)の場合、平瓦と同じオフセットを軒瓦にも適用する。
+        # 基準(u=0)はケラバそのもの、オフセットがあればそこから内側から敷き始める
+        # (平瓦と同じ考え方。ケラバの出自体は割付計算にのみ使うもので、ここでは
+        # 軒瓦のライン上には敷く枚数・位置に影響しない)。
+        # 平瓦と同様、この面のその辺自体が境界(ケラバ)でなければオフセットは適用しない。
+        n_verts = len(local_coords)
+        left_is_boundary = edge_is_boundary[(n_verts - 1) % n_verts]
+        right_is_boundary = edge_is_boundary[1 % n_verts]
+        left_offset = (verge_left_obj.get("kawara_flat_offset_mm", 0.0) / 1000.0) if (verge_left_obj is not None and left_is_boundary) else 0.0
+        right_offset = (verge_right_obj.get("kawara_flat_offset_mm", 0.0) / 1000.0) if (verge_right_obj is not None and right_is_boundary) else 0.0
+        eff_offset_x = left_offset if offset_x is None else offset_x
 
-    name_suffix = _face_ref_suffix(face_obj, face_index)
-    kawara_col = _get_or_create_kawara_collection(face_obj)
-    created, count = _lay_tiles_along_line_fixed_rotation(coords, eave_obj, pitch, f"{name_suffix}_kawara_eave", euler, collection=kawara_col)
-    for o in created:
-        _tag_face_reference(o, face_obj, face_index, "eave")
-        o["kawara_pitch_mm"] = pitch * 1000.0
-        _set_parent_keep_transform(o, face_obj)
-    return created, count
+        # 平瓦と同じ考え方: 隅棟など境界でない辺が軒先から棟にかけて外側へ広がって
+        # いる場合、その辺が軒先と交わる側の端点を、瓦1枚分(ベースのピッチ分)だけ
+        # 外側に仮想的に伸ばしてから軒瓦のラインを敷く(実際のメッシュ・頂点は
+        # 一切変更しない)。平瓦側は軒に一番近い段を軒瓦に譲る仕組みになっているため、
+        # 軒瓦がここまで追従しないと、隅棟の軒側だけ隙間が残ってしまう。
+        base_pitch_eave = spec.hataraki_haba / 1000.0
+        extend_left = 0.0
+        extend_right = 0.0
+        if not left_is_boundary:
+            idx_last = (n_verts - 1) % n_verts
+            u_top, w_top = local_coords[idx_last]
+            if w_top > 1e-6 and u_top < -1e-6:
+                extend_left = base_pitch_eave
+        if not right_is_boundary:
+            idx1 = 1 % n_verts
+            idx2 = 2 % n_verts
+            u1, w1 = local_coords[idx1]
+            u2, w2 = local_coords[idx2]
+            if (w2 - w1) > 1e-6 and (u2 - u1) > 1e-6:
+                extend_right = base_pitch_eave
+
+        coords = [
+            verts[0] - x_axis * extend_left + x_axis * eff_offset_x,
+            verts[1] + x_axis * extend_right - x_axis * right_offset,
+        ]
+        euler = _rotation_euler(x_axis, y_axis, normal)
+
+        # ケラバの出(kerava_overhang): 平瓦と同じ考え方で、割付計算(何枚敷けるか)に
+        # だけ使う。屋根面の幅に、ケラバの出を左右2か所分足した「仮想屋根面」の
+        # 幅を使って枚数・ピッチを決める(基準点自体はオフセットのみで決まる)。
+        kerava_overhang = spec.kerava_overhang / 1000.0
+        edge_width = max((verts[1] - verts[0]).length + extend_left + extend_right + 2 * kerava_overhang - left_offset, 1e-6)
+        tile_width_mm = eave_obj.get("kawara_tile_width_mm")
+        tile_width = (tile_width_mm / 1000.0) if tile_width_mm is not None else None
+        _, pitch = _fit_pitch(edge_width, spec.hataraki_haba / 1000.0, spec.chousei_sunpo / 1000.0, tile_width=tile_width)
+
+        name_suffix = _face_ref_suffix(face_obj, face_index)
+        kawara_col = _get_or_create_kawara_collection(face_obj)
+        created, count = _lay_tiles_along_line_fixed_rotation(coords, eave_obj, pitch, f"{name_suffix}_kawara_eave", euler, collection=kawara_col)
+        for o in created:
+            _tag_face_reference(o, face_obj, face_index, "eave")
+            o["kawara_pitch_mm"] = pitch * 1000.0
+            _set_parent_keep_transform(o, face_obj)
+
+        all_created += created
+        total_count += count
+
+    return all_created, total_count
 
 
 def lay_verge_tiles(face_obj, col, side):
     """屋根面の左右の辺に沿って袖瓦を敷く。side は 'left' か 'right'。
     軒側の辺(verts[0]→verts[1])を基準に、
     左袖 = verts[-1]→verts[0]、右袖 = verts[1]→verts[2] の辺を使う。
+    編集モードで複数の面を選択している場合は、それぞれの面について独立に処理する。
     """
     roles = find_role_objects(col)
     role_key = "verge_left" if side == "left" else "verge_right"
@@ -1029,41 +1106,46 @@ def lay_verge_tiles(face_obj, col, side):
     # セット内に「左袖軒」・「右袖軒」があれば、軒に最も近い1段目だけそちらを使う
     first_tile_obj = roles.get(eave_role_key)
 
-    verts, _, edge_is_boundary = _get_face_verts(face_obj)
-    n = len(verts)
-    if n < 3:
-        raise ValueError("対象オブジェクトは3頂点以上の平面である必要があります。")
-
-    own_edge_index = (n - 1) if side == "left" else 1
-    if not edge_is_boundary[own_edge_index % n]:
-        return [], 0
-
-    if side == "left":
-        coords = [verts[0], verts[-1]]
-    else:
-        coords = [verts[1], verts[2 % n]]
-
-    origin, x_axis, y_axis, normal, width, slope_len, local_coords, face_index, _unused_edge_bnd = _get_face_frame(face_obj)
-
-    # 袖瓦には専用のピッチ・調整可能寸法は無く、平瓦・軒瓦の長さ方向ピッチ
-    # (hataraki_nagasa)にそのまま揃える(_fit_pitchによる調整は行わない)。
-    # スタート位置(1枚目、左右袖軒があればそちらが使われる位置)は軒の実際の
-    # 端(coords[0])のまま動かさない。左右袖軒がある場合、2枚目(通常の左右袖の
-    # 1段目)はピッチ分進んだ位置になり、これが平瓦の軒瓦がある場合の1段目の
-    # 位置と自然に一致する。
     spec = bpy.context.scene.kawara_working_spec
     pitch = spec.hataraki_nagasa / 1000.0
-
-    name_suffix = _face_ref_suffix(face_obj, face_index)
     role = "verge_left" if side == "left" else "verge_right"
-    name_prefix = f"{name_suffix}_kawara_verge_{'L' if side == 'left' else 'R'}"
-    kawara_col = _get_or_create_kawara_collection(face_obj)
-    created, count = _lay_verge_tiles_with_dynamic_rotation(coords, verge_obj, pitch, name_prefix, normal, collection=kawara_col, first_tile_obj=first_tile_obj)
-    for o in created:
-        _tag_face_reference(o, face_obj, face_index, role)
-        o["kawara_pitch_mm"] = pitch * 1000.0
-        _set_parent_keep_transform(o, face_obj)
-    return created, count
+
+    all_created = []
+    total_count = 0
+
+    for (verts, _face_index_v, edge_is_boundary), (origin, x_axis, y_axis, normal, width, slope_len, local_coords, face_index, _unused_edge_bnd) in zip(_get_face_verts(face_obj), _get_face_frame(face_obj)):
+        n = len(verts)
+        if n < 3:
+            raise ValueError("対象オブジェクトは3頂点以上の平面である必要があります。")
+
+        own_edge_index = (n - 1) if side == "left" else 1
+        if not edge_is_boundary[own_edge_index % n]:
+            continue
+
+        if side == "left":
+            coords = [verts[0], verts[-1]]
+        else:
+            coords = [verts[1], verts[2 % n]]
+
+        # 袖瓦には専用のピッチ・調整可能寸法は無く、平瓦・軒瓦の長さ方向ピッチ
+        # (hataraki_nagasa)にそのまま揃える(_fit_pitchによる調整は行わない)。
+        # スタート位置(1枚目、左右袖軒があればそちらが使われる位置)は軒の実際の
+        # 端(coords[0])のまま動かさない。左右袖軒がある場合、2枚目(通常の左右袖の
+        # 1段目)はピッチ分進んだ位置になり、これが平瓦の軒瓦がある場合の1段目の
+        # 位置と自然に一致する。
+        name_suffix = _face_ref_suffix(face_obj, face_index)
+        name_prefix = f"{name_suffix}_kawara_verge_{'L' if side == 'left' else 'R'}"
+        kawara_col = _get_or_create_kawara_collection(face_obj)
+        created, count = _lay_verge_tiles_with_dynamic_rotation(coords, verge_obj, pitch, name_prefix, normal, collection=kawara_col, first_tile_obj=first_tile_obj)
+        for o in created:
+            _tag_face_reference(o, face_obj, face_index, role)
+            o["kawara_pitch_mm"] = pitch * 1000.0
+            _set_parent_keep_transform(o, face_obj)
+
+        all_created += created
+        total_count += count
+
+    return all_created, total_count
 
 
 # ---------------------------------------------------------------------------
@@ -1136,6 +1218,53 @@ def _get_ordered_polyline(line_obj):
         bm.free()
 
     return coords
+
+
+def _get_ordered_polylines(line_obj):
+    """ライン用オブジェクトから、選択されている辺を「1本ずつ完全に独立したライン」として
+    扱い、それぞれ順序付き(低いZ→高いZ)のワールド座標リストにして返す。
+    棟・隅棟のラインは実際には全部「頂点2つの直線1本」である前提。頂点を共有していても
+    (例: 寄棟で複数の隅棟が同じ棟の端点に集まっている場合など)繋がっているとはみなさず、
+    辺ごとに完全に独立して扱う。以前は頂点を共有する辺同士を1本の折れ線として繋げて
+    歩く実装にしていたが、寄棟のように複数の隅棟が同じ点に合流している場合、その合流点を
+    またいで隣の隅棟まで繋げてしまい、「合流点(頂上)まで上ってから、隣の隅棟の分だけ
+    下ってしまう」という誤ったラインとして扱われる不具合があった。棟・隅棟は常に
+    頂点2つの直線1本という前提が成り立つので、辺ごとに完全に独立させることでこれを回避する。
+    編集モードで一部の辺だけ選択している場合は、その選択された辺だけを使う。
+    戻り値: [各辺の順序付き座標リスト([始点, 終点])、...] (選択されている辺の数だけ要素がある)
+    """
+    mat = line_obj.matrix_world
+
+    if line_obj.mode == 'EDIT':
+        bm = bmesh.from_edit_mesh(line_obj.data)
+        selected_edges = [e for e in bm.edges if e.select]
+        owns_bm = False
+    else:
+        bm = bmesh.new()
+        bm.from_mesh(line_obj.data)
+        selected_edges = list(bm.edges)
+        owns_bm = True
+
+    if not selected_edges:
+        if owns_bm:
+            bm.free()
+        raise ValueError("使用する辺がありません(編集モードなら対象の辺を選択してください)。")
+
+    polylines = []
+    for e in selected_edges:
+        v0, v1 = e.verts[0], e.verts[1]
+        p0 = mat @ v0.co
+        p1 = mat @ v1.co
+        if p0.z <= p1.z:
+            polylines.append([p0, p1])
+        else:
+            polylines.append([p1, p0])
+
+    if owns_bm:
+        bm.free()
+
+    return polylines
+
 
 
 def _coords_ref_suffix(coords):
@@ -1319,29 +1448,37 @@ def lay_line_tiles(line_obj, tile_obj, pitch, reverse=False):
     棟瓦本体を敷く前に、両端点(ケラバ/隅棟収束)を判定し、
     ケラバ側(巴瓦あり)は巴瓦の幅の分だけ短縮、隅棟収束側は棟ピッチ1本分延長してから、
     実際のピッチ計算・配置を行う。
+    離れた複数本のラインを同時選択した場合は、連結成分ごとに分けて、それぞれ
+    1本ずつ選んだ時と同じ処理を独立して行う(_get_ordered_polylines を参照)。
     """
-    coords = _get_ordered_polyline(line_obj)
-    if reverse:
-        coords = list(reversed(coords))
-
     col = bpy.context.scene.kawara_tool_props.tile_collection
-    effective_coords, start_type, end_type = _compute_effective_ridge_coords(line_obj, coords, col, pitch)
-
-    suffix = _coords_ref_suffix(coords)
     kawara_col = _get_or_create_kawara_collection(line_obj)
-    created, count = _lay_tiles_along_coords(effective_coords, tile_obj, pitch, f"{line_obj.name}_{suffix}_kawara", collection=kawara_col)
-    for o in created:
-        o["kawara_pitch_mm"] = pitch * 1000.0
-        _set_parent_keep_transform(o, line_obj)
 
-    if col is not None:
-        end_cap_objs = _place_ridge_end_caps(line_obj, coords, col, kawara_col)
-        for o in end_cap_objs:
+    all_created = []
+    total_count = 0
+    for coords in _get_ordered_polylines(line_obj):
+        if reverse:
+            coords = list(reversed(coords))
+
+        effective_coords, start_type, end_type = _compute_effective_ridge_coords(line_obj, coords, col, pitch)
+
+        suffix = _coords_ref_suffix(coords)
+        created, count = _lay_tiles_along_coords(effective_coords, tile_obj, pitch, f"{line_obj.name}_{suffix}_kawara", collection=kawara_col)
+        for o in created:
+            o["kawara_pitch_mm"] = pitch * 1000.0
             _set_parent_keep_transform(o, line_obj)
-        created += end_cap_objs
-        count += len(end_cap_objs)
 
-    return created, count
+        if col is not None:
+            end_cap_objs = _place_ridge_end_caps(line_obj, coords, col, kawara_col)
+            for o in end_cap_objs:
+                _set_parent_keep_transform(o, line_obj)
+            created += end_cap_objs
+            count += len(end_cap_objs)
+
+        all_created += created
+        total_count += count
+
+    return all_created, total_count
 
 
 def _find_ridge_direction_at_endpoint(line_obj, end_point_world, exclude_direction):
@@ -1488,11 +1625,10 @@ def lay_hip_line_tiles(line_obj, tile_obj, pitch, reverse=False):
     コレクションに隅棟巴瓦・隅棟鬼瓦(役物)があれば、軒先側の端点に自動で配置する(無ければ何もしない)。
     隅棟巴瓦がある場合、棟と同様に、本体の実際の敷き始めを巴瓦の幅の分だけ内側にずらす
     (巴瓦の終点=本体の始点、に揃えるため)。
+    離れた複数本のラインを同時選択した場合は、連結成分ごとに分けて、それぞれ
+    1本ずつ選んだ時と同じ処理を独立して行う(_get_ordered_polylines を参照)。
     """
-    coords = _get_ordered_polyline(line_obj)
-    if reverse:
-        coords = list(reversed(coords))
-    suffix = _coords_ref_suffix(coords)
+    suffix_source = _get_ordered_polylines(line_obj)  # 連結成分ごとの座標リスト
     kawara_col = _get_or_create_kawara_collection(line_obj)
 
     col = bpy.context.scene.kawara_tool_props.tile_collection
@@ -1504,37 +1640,47 @@ def lay_hip_line_tiles(line_obj, tile_obj, pitch, reverse=False):
         if xs:
             tomoe_width = max(xs)
 
-    effective_coords = list(coords)
-    if tomoe_width > 0 and len(coords) >= 2:
-        # 隅棟巴瓦の"終点"と本体1枚目の"始点"を突き合わせて隙間・重なりを
-        # 作らないため、本体の敷き始めを巴瓦の幅の分だけ内側(棟側)にずらす。
-        # 棟(lay_line_tiles → _compute_effective_ridge_coords)のケラバ側と同じ考え方。
-        hip_direction = (coords[1] - coords[0]).normalized()
-        effective_coords[0] = coords[0] + hip_direction * tomoe_width
+    all_created = []
+    total_count = 0
+    for coords in suffix_source:
+        if reverse:
+            coords = list(reversed(coords))
+        suffix = _coords_ref_suffix(coords)
 
-    created, count = _lay_tiles_along_coords_simple(effective_coords, tile_obj, pitch, f"{line_obj.name}_{suffix}_kawara_hip", collection=kawara_col)
+        effective_coords = list(coords)
+        if tomoe_width > 0 and len(coords) >= 2:
+            # 隅棟巴瓦の"終点"と本体1枚目の"始点"を突き合わせて隙間・重なりを
+            # 作らないため、本体の敷き始めを巴瓦の幅の分だけ内側(棟側)にずらす。
+            # 棟(lay_line_tiles → _compute_effective_ridge_coords)のケラバ側と同じ考え方。
+            hip_direction = (coords[1] - coords[0]).normalized()
+            effective_coords[0] = coords[0] + hip_direction * tomoe_width
 
-    end_point = coords[-1]
-    end_direction = (coords[-1] - coords[-2]).normalized()
-    ridge_direction = _find_ridge_direction_at_endpoint(line_obj, end_point, end_direction)
+        created, count = _lay_tiles_along_coords_simple(effective_coords, tile_obj, pitch, f"{line_obj.name}_{suffix}_kawara_hip", collection=kawara_col)
 
-    for o in created:
-        o["kawara_line_object"] = line_obj.name
-        o["kawara_hip_end_point"] = tuple(end_point)
-        o["kawara_hip_end_direction"] = tuple(end_direction)
-        o["kawara_pitch_mm"] = pitch * 1000.0
-        _set_parent_keep_transform(o, line_obj)
-        if ridge_direction is not None:
-            o["kawara_hip_ridge_direction"] = tuple(ridge_direction)
+        end_point = coords[-1]
+        end_direction = (coords[-1] - coords[-2]).normalized()
+        ridge_direction = _find_ridge_direction_at_endpoint(line_obj, end_point, end_direction)
 
-    if col is not None:
-        end_cap_objs = _place_hip_end_caps(line_obj, coords, col, kawara_col)
-        for o in end_cap_objs:
+        for o in created:
+            o["kawara_line_object"] = line_obj.name
+            o["kawara_hip_end_point"] = tuple(end_point)
+            o["kawara_hip_end_direction"] = tuple(end_direction)
+            o["kawara_pitch_mm"] = pitch * 1000.0
             _set_parent_keep_transform(o, line_obj)
-        created += end_cap_objs
-        count += len(end_cap_objs)
+            if ridge_direction is not None:
+                o["kawara_hip_ridge_direction"] = tuple(ridge_direction)
 
-    return created, count
+        if col is not None:
+            end_cap_objs = _place_hip_end_caps(line_obj, coords, col, kawara_col)
+            for o in end_cap_objs:
+                _set_parent_keep_transform(o, line_obj)
+            created += end_cap_objs
+            count += len(end_cap_objs)
+
+        all_created += created
+        total_count += count
+
+    return all_created, total_count
 
 
 def cut_ridge_tiles_to_end(ridge_obj):
@@ -1690,6 +1836,19 @@ def _update_tile_collection(self, context):
         refresh_spec_from_collection_props(self.tile_collection, context)
 
 
+def _poll_kawara_collection(self, collection):
+    """瓦コレクションのポインタ選択候補を、実際に瓦の役割オブジェクト(平・軒・袖など)が
+    入っているコレクションだけに絞り込む。find_role_objects と同じ判定基準(kawara_role
+    タグ優先、無ければ名前フォールバック)を使うので、既存のセットも漏れなく候補に残る。
+    「瓦」という名前は _get_or_create_kawara_collection が生成する自動出力先の固定名なので、
+    元となる役割オブジェクトのセットではなく除外する(生成済みの瓦インスタンスにも
+    kawara_role が付いているため、名前チェックなしだと候補に紛れ込んでしまう)。
+    """
+    if collection.name == "瓦":
+        return False
+    return bool(find_role_objects(collection))
+
+
 def _list_kawara_set_files():
     """KawaraSet フォルダ内の .blend ファイル名一覧を返す。"""
     folder = _get_kawara_set_folder()
@@ -1717,6 +1876,7 @@ class KawaraToolProps(bpy.types.PropertyGroup):
     tile_collection: PointerProperty(
         name="瓦コレクション", type=bpy.types.Collection,
         description="平・軒・袖(左右)・棟・隅棟のオブジェクトが入ったコレクションを指定",
+        poll=_poll_kawara_collection,
         update=_update_tile_collection,
     )
     ridge_reverse: BoolProperty(
@@ -1726,7 +1886,7 @@ class KawaraToolProps(bpy.types.PropertyGroup):
     )
     random_seed: bpy.props.IntProperty(
         name="ランダムシード",
-        description="瓦ごとの色ムラなどに使うランダムパターンの種。値を変える(振り直す)と模様が変わる。",
+        description="瓦ごとの色ムラなどに用。カット・メッシュ化前のみ有効",
         default=0,
     )
     kawara_set_file: bpy.props.EnumProperty(
@@ -1766,6 +1926,9 @@ def _reroll_seed_new_value(context):
 def _apply_seed_to_existing_tiles(context):
     """今のランダムシード値を、既に配置済みの瓦(KawaraTileLayモディファイア持ち)
     すべてに反映し、即座に画面に反映させる。戻り値: 反映したオブジェクト数。
+    マテリアルプレビュー/レンダー表示のビューポートは、デプスグラフを更新しただけでは
+    再描画されず、オブジェクトを選択し直すまで色の変化が見えないことがあるため、
+    3Dビューポートに明示的に再描画を要求する。
     """
     props = context.scene.kawara_tool_props
     ng = bpy.data.node_groups.get("KawaraTileLay")
@@ -1792,21 +1955,106 @@ def _apply_seed_to_existing_tiles(context):
                 obj.update_tag()
 
     context.view_layer.update()
+
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
     return updated
 
 
 class KAWARA_OT_reroll_random_seed(bpy.types.Operator):
-    """ランダムシードを振り直し、既に配置済みの瓦にも即座に反映する
-    (瓦ごとの色ムラなどのパターンを変えたい場合に使う)。
-    """
+    """瓦ごとの色ムラなどのパターンを変えたい時用
+    (カット・メッシュ化前のみ有効)。"""
     bl_idname = "kawara.reroll_random_seed"
-    bl_label = "ランダムを振り直す"
+    bl_label = "乱数を振り直す"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         _reroll_seed_new_value(context)
         updated = _apply_seed_to_existing_tiles(context)
         self.report({'INFO'}, f"ランダムシードを振り直しました({updated}個のオブジェクトに反映)")
+        return {'FINISHED'}
+
+
+class KAWARA_OT_make_tile_materials_local(bpy.types.Operator):
+    """シーン内で瓦セットから実際に敷いた瓦(「瓦」という名前の子コレクション配下、
+    複数の屋根面があれば「瓦.001」等も含む)を、全瓦メッシュ化・マテリアルの
+    ローカルコピー化。
+    注意: 「瓦」コレクションの中身は無条件で実体化(メッシュ化)される。
+    メッシュ化したくないものはこのコレクションに入れないこと。"""
+    bl_idname = "kawara.make_tile_materials_local"
+    bl_label = "瓦マテリアルを変更可能にする"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        target_objs = []
+        for col in bpy.data.collections:
+            if col.name != "瓦" and not col.name.startswith("瓦."):
+                continue
+            target_objs.extend(col.all_objects)
+
+        if not target_objs:
+            self.report({'INFO'}, "対象の瓦が見つかりませんでした(「瓦」コレクションが空か、存在しません)。")
+            return {'FINISHED'}
+
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in target_objs:
+            obj.select_set(True)
+        context.view_layer.objects.active = target_objs[0]
+        bpy.ops.object.convert(target='MESH')
+
+        # 元マテリアル名 -> ローカルコピー のキャッシュ。今回の実行中だけでなく、
+        # 過去にこのボタンで作られたローカルコピー(_KAWARA_LOCAL_MAT_TAGタグ付き)も
+        # 種として拾っておく。これが無いと、後から瓦を追加で敷き直して再度この
+        # ボタンを押した時に、既に編集済みの共有マテリアルを使い回さず、
+        # 「銀黒.001」のような別物を毎回新規作成してしまい、色が食い違う瓦が
+        # 発生する(実機で確認済みの不具合)。
+        local_mat_cache = {}
+        for mat in bpy.data.materials:
+            tag = mat.get(_KAWARA_LOCAL_MAT_TAG)
+            if tag and mat.library is None:
+                local_mat_cache.setdefault(tag, mat)
+
+        changed_objs = 0
+        for obj in target_objs:
+            mesh = obj.data
+            if not (mesh and hasattr(mesh, "materials")):
+                continue
+            if mesh.library is not None:
+                continue  # 万一まだ実体化できていないものは安全のためスキップ
+
+            changed = False
+            for i, mat in enumerate(list(mesh.materials)):
+                if mat is None:
+                    continue
+                if mat.get(_KAWARA_LOCAL_MAT_TAG):
+                    continue  # 既にローカル編集用コピーが割り当て済み
+                if mat.library is None:
+                    continue  # 既にローカル(タグなしの独自ローカルマテリアル)ならそのまま
+                local_mat = local_mat_cache.get(mat.name)
+                if local_mat is None:
+                    local_mat = mat.copy()
+                    local_mat.name = mat.name
+                    local_mat[_KAWARA_LOCAL_MAT_TAG] = mat.name
+                    local_mat_cache[mat.name] = local_mat
+                mesh.materials[i] = local_mat
+                changed = True
+            if changed:
+                changed_objs += 1
+
+        if changed_objs == 0:
+            self.report(
+                {'INFO'},
+                f"{len(target_objs)}個の瓦を実体化しました。マテリアルは既にローカルでした。",
+            )
+        else:
+            names = "、".join(local_mat_cache.keys())
+            self.report(
+                {'INFO'},
+                f"{len(target_objs)}個の瓦を実体化し、{changed_objs}個のオブジェクトのマテリアルをローカル化しました({names})。",
+            )
         return {'FINISHED'}
 
 
@@ -1831,7 +2079,9 @@ class KAWARA_OT_load_kawara_sets(bpy.types.Operator):
 
 
 class KAWARA_OT_lay_roof(bpy.types.Operator):
-    """選択中の屋根面(平面ポリゴン)に、平瓦→軒瓦→袖瓦の順で敷く"""
+    """選択中の屋根面(平面ポリゴン)に、平瓦→軒瓦→袖瓦の順で敷く。
+    複数の屋根面オブジェクトを同時選択した場合は、1つずつ選んで実行した時と
+    同じように、それぞれの面に対して独立して敷く。"""
     bl_idname = "kawara.lay_roof"
     bl_label = "屋根面に瓦を敷く"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1846,33 +2096,74 @@ class KAWARA_OT_lay_roof(bpy.types.Operator):
         )
 
     def execute(self, context):
-        face_obj = context.active_object
         props = context.scene.kawara_tool_props
         col = props.tile_collection
-        _reroll_seed_new_value(context)
 
-        try:
-            created_flat, n_flat = lay_flat_tiles(face_obj, col)
-            created_eave, n_eave = lay_eave_tiles(face_obj, col)
-            created_vl, n_vl = lay_verge_tiles(face_obj, col, "left")
-            created_vr, n_vr = lay_verge_tiles(face_obj, col, "right")
-        except Exception as e:
-            self.report({'ERROR'}, str(e))
+        face_objs = [o for o in context.selected_objects if o.type == 'MESH']
+        if not face_objs and context.active_object is not None and context.active_object.type == 'MESH':
+            face_objs = [context.active_object]
+        if not face_objs:
+            self.report({'ERROR'}, "屋根面(メッシュオブジェクト)を選択してください。")
             return {'CANCELLED'}
 
-        created = created_flat + created_eave + created_vl + created_vr
+        _reroll_seed_new_value(context)
+        roles = find_role_objects(col)
+
+        all_created = []
+        total_flat = total_eave = total_vl = total_vr = 0
+        missing_by_face = {}
+
+        for face_obj in face_objs:
+            try:
+                created_flat, n_flat = lay_flat_tiles(face_obj, col)
+                created_eave, n_eave = lay_eave_tiles(face_obj, col)
+                created_vl, n_vl = lay_verge_tiles(face_obj, col, "left")
+                created_vr, n_vr = lay_verge_tiles(face_obj, col, "right")
+            except Exception as e:
+                self.report({'ERROR'}, f"「{face_obj.name}」: {e}")
+                return {'CANCELLED'}
+
+            # 軒瓦・袖瓦用のオブジェクトがコレクションにちゃんと登録されているのに
+            # 0枚だった場合、大抵は「軒先/ケラバに該当する辺が境界として認識されな
+            # かった」ことが原因(法線の向きの自動修正を試みても直らないケースなど)
+            # なので、原因に気付きやすいよう警告しておく。
+            missing = []
+            if roles.get("eave") is not None and n_eave == 0:
+                missing.append("軒瓦")
+            if roles.get("verge_left") is not None and n_vl == 0:
+                missing.append("左袖瓦")
+            if roles.get("verge_right") is not None and n_vr == 0:
+                missing.append("右袖瓦")
+            if missing:
+                missing_by_face[face_obj.name] = missing
+
+            all_created += created_flat + created_eave + created_vl + created_vr
+            total_flat += n_flat
+            total_eave += n_eave
+            total_vl += n_vl
+            total_vr += n_vr
+
+        if missing_by_face:
+            detail = "、".join(f"{name}({'・'.join(m)})" for name, m in missing_by_face.items())
+            self.report(
+                {'WARNING'},
+                f"0枚だった役物があります: {detail}。対象の辺が軒先/ケラバとして認識されなかった"
+                f"可能性があります(法線の向きは自動修正済みです。それでも直らない場合は、"
+                f"隣接する面が実際に存在する形状になっていないか確認してください)。",
+            )
+
         # 編集モードで作業中だった場合は、アクティブオブジェクトを変えると
         # 強制的にオブジェクトモードへ戻されてしまうため、その場合は変更しない
-        if face_obj.mode != 'EDIT':
-            for o in created:
+        if not any(o.mode == 'EDIT' for o in face_objs):
+            for o in all_created:
                 o.select_set(True)
-            if created:
-                context.view_layer.objects.active = created[0]
+            if all_created:
+                context.view_layer.objects.active = all_created[0]
 
-        total = n_flat + n_eave + n_vl + n_vr
+        total = total_flat + total_eave + total_vl + total_vr
         self.report(
             {'INFO'},
-            f"瓦を敷きました(平{n_flat} / 軒{n_eave} / 左袖{n_vl} / 右袖{n_vr} / 合計{total}枚)",
+            f"{len(face_objs)}面に瓦を敷きました(平{total_flat} / 軒{total_eave} / 左袖{total_vl} / 右袖{total_vr} / 合計{total}枚)",
         )
         return {'FINISHED'}
 
@@ -2197,17 +2488,11 @@ def draw_kawara_panel(layout, context):
     box = layout.box()
     box.prop(props, "kawara_set_file", text="")
     box.operator(KAWARA_OT_load_kawara_sets.bl_idname, icon='IMPORT')
-    col0 = box.column(align=True)
-    col0.scale_y = 0.8
-    col0.label(text="KawaraSetフォルダの.blendから選んだ瓦セットをLinkで読み込む")
-
+    
     box = layout.box()
     box.label(text="1. 瓦コレクションを指定", icon='OUTLINER_COLLECTION')
     box.prop(props, "tile_collection", text="")
-    col = box.column(align=True)
-    col.scale_y = 0.8
-    col.label(text="名前に 平/軒瓦/右袖/左袖/棟/隅棟 を含めてください")
-
+    
     if props.tile_collection:
         spec = context.scene.kawara_working_spec
         box = layout.box()
@@ -2230,6 +2515,9 @@ def draw_kawara_panel(layout, context):
         row2 = box.row(align=True)
         row2.operator(KAWARA_OT_lay_verge_line_left.bl_idname)
         row2.operator(KAWARA_OT_lay_verge_line_right.bl_idname)
+        row3 = box.row(align=True)
+        row3.operator(KAWARA_OT_reroll_random_seed.bl_idname, icon='FILE_REFRESH')
+        row3.label(text=str(props.random_seed))
 
         box = layout.box()
         box.label(text="3. はみ出しをカット (任意)", icon='MOD_BOOLEAN')
@@ -2237,7 +2525,7 @@ def draw_kawara_panel(layout, context):
 
         col3 = box.column(align=True)
         col3.scale_y = 0.8
-        col3.label(text="個別にカットしたい場合(瓦オブジェクトを選択):")
+        col3.label(text="個別カット(瓦オブジェクトを選択):")
         colc = box.column(align=True)
         row = colc.row(align=True)
         row.operator(KAWARA_OT_cut_flat_overhang.bl_idname, text="平瓦をカット")
@@ -2249,9 +2537,11 @@ def draw_kawara_panel(layout, context):
         colc.operator(KAWARA_OT_cut_verge_line_overhang.bl_idname, text="袖瓦をカット(ライン配置分)")
 
     box = layout.box()
-    row = box.row(align=True)
-    row.operator(KAWARA_OT_reroll_random_seed.bl_idname, icon='FILE_REFRESH')
-    row.label(text=str(props.random_seed))
+    box.label(text="4. 瓦マテリアルを変更可能にする (任意)", icon='MATERIAL')
+    col4 = box.column(align=True)
+    col4.scale_y = 0.8
+    col4.label(text="メッシュ化したくないものは「瓦」コレクションに入れないでください")
+    box.operator(KAWARA_OT_make_tile_materials_local.bl_idname, icon='MATERIAL')
 
 
 # ---------------------------------------------------------------------------
@@ -2414,9 +2704,12 @@ def cut_all_tiles_by_face_ref(face_obj_name, face_index):
 def cut_all_tiles_to_face(face_obj):
     """指定した屋根面(オブジェクト、または編集モードで選択中の面)に対応する
     平瓦・軒瓦・左右袖瓦をまとめてカットする(面を選び直す従来の使い方)。
+    編集モードで複数の面が選択されている場合は、それぞれの面について独立に処理する。
     """
-    verts, face_index, _edge_bnd = _get_face_verts(face_obj)
-    return cut_all_tiles_by_face_ref(face_obj.name, face_index)
+    done_all = []
+    for verts, face_index, _edge_bnd in _get_face_verts(face_obj):
+        done_all.extend(cut_all_tiles_by_face_ref(face_obj.name, face_index))
+    return done_all
 
 
 class KAWARA_OT_cut_flat_overhang(bpy.types.Operator):
@@ -2526,6 +2819,7 @@ classes = (
     KAWARA_OT_reroll_random_seed,
     KAWARA_OT_load_kawara_sets,
     KAWARA_OT_refresh_spec,
+    KAWARA_OT_make_tile_materials_local,
     KAWARA_OT_lay_roof,
     KAWARA_OT_lay_ridge,
     KAWARA_OT_lay_hip,
@@ -2557,53 +2851,98 @@ def _find_layer_collection(layer_coll, target_name):
     return None
 
 
-def _hide_and_exclude_collection(context, collection):
-    """コレクションをビューポート非表示にし、ビューレイヤーからも除外する
-    (参照(Link)自体は残したまま、画面上・評価対象から隠すだけ)。
+_KAWARA_LOCAL_MAT_TAG = "kawara_local_override_of"  # ローカル編集コピーに付ける「元マテリアル名」タグ
+
+
+def _hide_collection_viewport(context, collection):
+    """コレクションをビューポート非表示にするだけ(ビューレイヤーからは除外しない)。
+    ライブラリオーバーライドはビューレイヤーに実際に含まれていないと正しく機能しない
+    ため、除外はせず非表示だけに留める。
     """
     collection.hide_viewport = True
-    layer_coll = _find_layer_collection(context.view_layer.layer_collection, collection.name)
-    if layer_coll is not None:
-        layer_coll.exclude = True
 
 
 def _load_kawara_set_file(context, fname):
     """指定した1つの .blend ファイルから、今のシーンにまだ無い瓦セット(コレクション)を
-    Link で読み込む(ファイル本体はコピーせず参照だけにする)。
-    読み込んだコレクションは、ビューポート非表示・ビューレイヤー除外にしておく
-    (瓦セット自体は画面に表示する必要が無い「素材置き場」のため)。
+    プレーンLinkで読み込む。
+    (以前はここでライブラリオーバーライド化 + マテリアルのローカルコピー化までしていたが、
+    オーバーライド周りは再読み込み時のデデュープ判定など罠が多く運用上のリスクが高いため撤回。
+    マテリアル調整は大元の瓦セットファイル自体を別のBlenderで開いて編集・保存する運用にした。
+    Linkなら大元を更新するだけで、参照してる全プロジェクトに自動で反映される。
+    プロジェクト単位でどうしても1個だけ色を変えたい等の稀なケースは、
+    _make_materials_locally_editable() を手動で個別に呼んで対応する。)
     戻り値: 実際に読み込んだコレクション名のリスト。
     """
     scene = context.scene
+    view_layer = context.view_layer
     folder = _get_kawara_set_folder()
     path = os.path.join(folder, fname)
     if not os.path.isfile(path):
         return []
 
-    scene_children_names = {c.name for c in scene.collection.children}
-    loaded = []
+    # dedup対象は「このライブラリファイルから読み込んだコレクション」だけに絞る。
+    # 単純にシーン内の全コレクション名で見てしまうと、たまたま同名の別ファイル由来
+    # コレクション(テスト残骸や別セットの同名コレクションなど)があるだけで、
+    # 本来読み込みたいコレクションが「既読み込み済み」と誤判定されてスキップされてしまう
+    # (loaded=[]で何も起きずサイレントに失敗する)ため、ライブラリの実体(ファイルパス)で
+    # 突き合わせる。
+    norm_path = os.path.normcase(os.path.abspath(bpy.path.abspath(path)))
+    lib = None
+    for l in bpy.data.libraries:
+        if os.path.normcase(os.path.abspath(bpy.path.abspath(l.filepath))) == norm_path:
+            lib = l
+            break
+    already_loaded_names = set()
+    if lib is not None:
+        for c in bpy.data.collections:
+            if c.library == lib:
+                already_loaded_names.add(c.name)
+
+    loaded_cols = []
 
     try:
         with bpy.data.libraries.load(path, link=True) as (data_from, data_to):
-            to_load = [name for name in data_from.collections if name not in scene_children_names]
+            to_load = [name for name in data_from.collections if name not in already_loaded_names]
             data_to.collections = to_load
 
         for col in data_to.collections:
             if col is None:
                 continue
-            if col.name not in [c.name for c in scene.collection.children]:
+            # 瓦セットの元ファイルには、実際の瓦役割オブジェクトが入ったコレクションの他に、
+            # Blenderがファイル作成時に自動生成する空の"Collection"のような副産物が
+            # 同梱されてることがある。これを無条件でシーンにリンクすると、読み込む側の
+            # プロジェクト側にたまたま同名のコレクション(ありがちな"Collection"など)が
+            # 既にある場合、名前が完全重複した状態になり、Blender側の可視性計算が混乱する
+            # (exclude/hide_viewportは正常なのにis_visibleだけ誤ってFalseになる、という
+            # 実害のあるBlender側の挙動を確認済み)。tile_collectionのpollフィルタと同じ
+            # find_role_objects基準で、実際に瓦の役割オブジェクトが入ってるものだけを
+            # シーンにリンクする。それ以外(副産物)はbpy.data内には読み込まれるが
+            # シーンには一切繋がないため、名前が重複しても衝突しようがない。
+            if not find_role_objects(col):
+                continue
+            # 名前だけで「既にシーン直下にあるか」を見ると、別ライブラリ由来の
+            # 同名コレクション(テスト残骸など)がscene.collection.childrenに既にある場合、
+            # このcol自体は一度もリンクされていないのに誤ってスキップしてしまい、
+            # bpy.data内に浮いた(users=0の)孤立コレクションが残るだけになる。
+            # データブロックの実体(オブジェクト同一性)で判定する。
+            if col not in list(scene.collection.children):
                 scene.collection.children.link(col)
-                loaded.append(col.name)
+            loaded_cols.append(col)
     except Exception as e:
         print(f"KawaraTiles: 瓦セットの読み込みに失敗しました({fname}): {e}")
 
     context.view_layer.update()
-    for name in loaded:
-        col = bpy.data.collections.get(name)
-        if col is not None:
-            _hide_and_exclude_collection(context, col)
+    # ここも名前で bpy.data.collections.get(name) して再取得すると、瓦セットのファイルに
+    # 同梱されてる副産物の"Collection"などが、シーン側で既に使われてるユーザー自身の
+    # ローカルな同名コレクション(作業用の"Collection"など)と名前が衝突した場合、
+    # 別物(ローカル側)を誤って返してしまうことがある。その状態で非表示をかけると、
+    # 今回読み込んだのとは無関係な、ユーザー自身の作業コレクションを誤って
+    # hide_viewport=True にしてしまう事故になる。ここでは実際にリンクした
+    # コレクションの実体(loaded_cols)をそのまま使い、名前での再検索はしない。
+    for col in loaded_cols:
+        _hide_collection_viewport(context, col)
 
-    return loaded
+    return [c.name for c in loaded_cols]
 
 
 def register():

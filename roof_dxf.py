@@ -1,3 +1,4 @@
+import os
 import bpy
 import bmesh
 import math
@@ -118,10 +119,12 @@ def scan_dxf_layers(filepath, unit_scale=0.001, arc_segments=16):
     return sorted(counts.items(), key=lambda item: -item[1])
 
 
-def import_dxf_lines(filepath, unit_scale=0.001, layer_filter=None, layer_names=None, arc_segments=16):
+def import_dxf_lines(filepath, unit_scale=0.001, layer_filter=None, layer_names=None, arc_segments=16, target_name="RoofLines"):
     """DXFの線を、面にしないまま編集可能なメッシュとしてインポートする。
     layer_names が指定されていれば、そのレイヤー名の集合に完全一致する線だけを読み込む
     (複数レイヤーの選択に対応)。無ければ layer_filter(部分一致)を使う(従来動作)。
+    target_name: 読み込んだ線を格納するメッシュ・オブジェクトの名前(既定は"RoofLines"。
+    アルミサッシなど屋根以外の用途で読み込む場合に分かりやすい名前へ変更できる)。
     """
     edges = _load_dxf_edges_cached(filepath, unit_scale=unit_scale, arc_segments=arc_segments)
     if layer_names is not None:
@@ -132,7 +135,7 @@ def import_dxf_lines(filepath, unit_scale=0.001, layer_filter=None, layer_names=
     if not edges:
         raise ValueError("DXFから線データが読み込めませんでした。")
 
-    mesh = bpy.data.meshes.new("RoofLines")
+    mesh = bpy.data.meshes.new(target_name)
     bm = bmesh.new()
     type_layer = bm.edges.layers.int.new(EDGE_TYPE_LAYER_NAME)
 
@@ -161,7 +164,7 @@ def import_dxf_lines(filepath, unit_scale=0.001, layer_filter=None, layer_names=
     bm.to_mesh(mesh)
     bm.free()
 
-    obj = bpy.data.objects.new("RoofLines", mesh)
+    obj = bpy.data.objects.new(target_name, mesh)
     bpy.context.collection.objects.link(obj)
     return obj, len(edges)
 
@@ -498,27 +501,6 @@ def set_height_reference(roof_obj, ref_line_obj):
     return _apply_height_reference_at_point(roof_obj, ref_x, ref_y)
 
 
-def delete_unneeded_lines(lines_obj):
-    """「不要(未分類)」の線を削除し、孤立した頂点も一緒に削除する。戻り値: 削除した線の本数"""
-    mesh = lines_obj.data
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-    type_layer = bm.edges.layers.int.get(EDGE_TYPE_LAYER_NAME)
-
-    to_delete = [e for e in bm.edges if (e[type_layer] if type_layer is not None else EDGE_TYPE_NONE) == EDGE_TYPE_NONE]
-    count = len(to_delete)
-    bmesh.ops.delete(bm, geom=to_delete, context='EDGES')
-
-    # 孤立頂点(どの線にもつながっていない頂点)を削除
-    isolated = [v for v in bm.verts if len(v.link_edges) == 0]
-    bmesh.ops.delete(bm, geom=isolated, context='VERTS')
-
-    bm.to_mesh(mesh)
-    bm.free()
-    mesh.update()
-    return count
-
-
 # ---------------------------------------------------------------------------
 # 勾配設定(x/10 と 角度を連動)
 # ---------------------------------------------------------------------------
@@ -565,12 +547,15 @@ class RoofToolProps(bpy.types.PropertyGroup):
         ],
         default="MM",
     )
-    dxf_layers: bpy.props.CollectionProperty(type=DXFLayerItem)
-    dxf_layers_index: IntProperty(default=0)
     dxf_arc_segments: IntProperty(
         name="円弧の分割数",
         description="DXFの円弧・円を、いくつの直線に分割して読み込むか(多いほど滑らかだが、線の本数が増える)",
         default=16, min=4, max=128,
+    )
+    dxf_target_name: StringProperty(
+        name="読み込み先オブジェクト名",
+        description="読み込んだ線を格納するオブジェクト名(屋根なら RoofLines、サッシなど別用途ならお好みの名前に)",
+        default="RoofLines",
     )
     dxf_section_collapsed: BoolProperty(
         name="読み込み済み",
@@ -623,10 +608,12 @@ class ROOF_UL_dxf_layers(bpy.types.UIList):
         row.label(text=str(item.count))
 
 
-class ROOF_OT_scan_dxf_layers(bpy.types.Operator, ImportHelper):
-    """DXFファイルを選び、中に含まれるレイヤー一覧(と本数)を読み込む(まだメッシュ化はしない)"""
-    bl_idname = "roof.scan_dxf_layers"
-    bl_label = "DXFを開いてレイヤー一覧を読み込む"
+class ROOF_OT_import_dxf_lines(bpy.types.Operator, ImportHelper):
+    """DXFファイルを選び、円弧の分割数・読み込み先オブジェクト名・使うレイヤーまで
+    ファイルブラウザのサイドパネルだけで設定して、線だけの編集可能なメッシュとしてインポートする。
+    """
+    bl_idname = "roof.import_dxf_lines"
+    bl_label = "DXFを読み込む"
     bl_options = {'REGISTER', 'UNDO'}
 
     filename_ext = ".dxf"
@@ -641,45 +628,65 @@ class ROOF_OT_scan_dxf_layers(bpy.types.Operator, ImportHelper):
         ],
         default="MM",
     )
+    arc_segments: IntProperty(
+        name="円弧の分割数",
+        description="DXFの円弧・円を、いくつの直線に分割して読み込むか(多いほど滑らかだが、線の本数が増える)",
+        default=16, min=4, max=128,
+    )
+    target_name: StringProperty(
+        name="読み込み先オブジェクト名",
+        description="読み込んだ線を格納するオブジェクト名(屋根なら RoofLines、サッシなど別用途ならお好みの名前に)",
+        default="RoofLines",
+    )
+    layers: bpy.props.CollectionProperty(type=DXFLayerItem)
+    layers_index: IntProperty(default=0)
 
-    def execute(self, context):
+    def _ensure_layers_scanned(self):
+        """ファイルパス・分割数が変わったら、レイヤー一覧を読み直す。
+        ファイルブラウザのサイドパネルが再描画されるたびに呼ばれるので、
+        同じ組み合わせなら読み直さない(キャッシュ)。分割数だけ変えた場合は
+        同名レイヤーのチェック状態を維持する。
+        """
+        key = (self.filepath, self.arc_segments)
+        if getattr(self, "_scanned_key", None) == key:
+            return
         try:
-            import ezdxf  # noqa: F401
-        except ImportError:
-            self.report({'ERROR'}, "ezdxf がインストールされていません。")
-            return {'CANCELLED'}
-
-        unit_scale = UNIT_SCALES[self.unit_mode]
-        props = context.scene.roof_tool_props
-        try:
-            layer_counts = scan_dxf_layers(self.filepath, unit_scale=unit_scale, arc_segments=props.dxf_arc_segments)
-        except Exception as e:
-            self.report({'ERROR'}, str(e))
-            return {'CANCELLED'}
-
-        props.dxf_filepath = self.filepath
-        props.dxf_unit_mode = self.unit_mode
-        props.dxf_layers.clear()
+            layer_counts = scan_dxf_layers(
+                self.filepath, unit_scale=UNIT_SCALES[self.unit_mode], arc_segments=self.arc_segments,
+            )
+        except Exception:
+            return
+        prev_use = {item.name: item.use for item in self.layers}
+        self.layers.clear()
         for name, count in layer_counts:
-            item = props.dxf_layers.add()
+            item = self.layers.add()
             item.name = name
             item.count = count
-            item.use = False
+            item.use = prev_use.get(name, True)
+        self._scanned_key = key
 
-        self.report({'INFO'}, f"{len(layer_counts)}個のレイヤーを見つけました。使うレイヤーにチェックを入れて読み込んでください。")
-        return {'FINISHED'}
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "unit_mode")
+        layout.prop(self, "arc_segments")
+        layout.prop(self, "target_name")
 
+        if self.filepath and self.filepath.lower().endswith(".dxf") and os.path.isfile(self.filepath):
+            self._ensure_layers_scanned()
+            box = layout.box()
+            box.label(text="使うレイヤー(複数選択可):")
+            box.template_list(
+                "ROOF_UL_dxf_layers", "", self, "layers", self, "layers_index", rows=6,
+            )
+        else:
+            layout.label(text="DXFファイルを選んでください", icon='INFO')
 
-class ROOF_OT_import_dxf_lines(bpy.types.Operator):
-    """チェックを入れたレイヤーの線だけを、編集可能な線メッシュ(RoofLines)としてインポート"""
-    bl_idname = "roof.import_dxf_lines"
-    bl_label = "選択したレイヤーを読み込む"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
+    def invoke(self, context, event):
         props = context.scene.roof_tool_props
-        return bool(props.dxf_filepath) and len(props.dxf_layers) > 0
+        self.unit_mode = props.dxf_unit_mode
+        self.arc_segments = props.dxf_arc_segments
+        self.target_name = props.dxf_target_name or "RoofLines"
+        return super().invoke(context, event)
 
     def execute(self, context):
         try:
@@ -689,26 +696,33 @@ class ROOF_OT_import_dxf_lines(bpy.types.Operator):
             self.report({'ERROR'}, "ezdxf / shapely がインストールされていません。")
             return {'CANCELLED'}
 
-        props = context.scene.roof_tool_props
-        unit_scale = UNIT_SCALES[props.dxf_unit_mode]
-        selected_layers = [item.name for item in props.dxf_layers if item.use]
+        self._ensure_layers_scanned()
+        selected_layers = [item.name for item in self.layers if item.use]
         if not selected_layers:
             self.report({'WARNING'}, "使うレイヤーが1つも選択されていません。")
             return {'CANCELLED'}
 
+        unit_scale = UNIT_SCALES[self.unit_mode]
+        target_name = self.target_name.strip() or "RoofLines"
         try:
             obj, num_edges = import_dxf_lines(
-                props.dxf_filepath, unit_scale=unit_scale, layer_names=selected_layers,
-                arc_segments=props.dxf_arc_segments,
+                self.filepath, unit_scale=unit_scale, layer_names=selected_layers,
+                arc_segments=self.arc_segments, target_name=target_name,
             )
         except Exception as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
 
+        props = context.scene.roof_tool_props
+        props.dxf_filepath = self.filepath
+        props.dxf_unit_mode = self.unit_mode
+        props.dxf_arc_segments = self.arc_segments
+        props.dxf_target_name = target_name
+        props.dxf_section_collapsed = True
+
         context.view_layer.objects.active = obj
         obj.select_set(True)
-        props.dxf_section_collapsed = True
-        self.report({'INFO'}, f"{num_edges}本の線を読み込みました。軒先などを選択して設定してください。")
+        self.report({'INFO'}, f"{num_edges}本の線を「{obj.name}」として読み込みました。軒先などを選択して設定してください。")
         return {'FINISHED'}
 
 
@@ -917,31 +931,6 @@ class ROOF_OT_set_height_reference(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class ROOF_OT_delete_unneeded_lines(bpy.types.Operator):
-    """「不要」のままの線(軒先も屋根の線も設定していない線)を一括削除する"""
-    bl_idname = "roof.delete_unneeded_lines"
-    bl_label = "不要な線を削除"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        return context.active_object is not None and context.active_object.type == 'MESH'
-
-    def execute(self, context):
-        obj = context.active_object
-        was_edit = obj.mode == 'EDIT'
-        if was_edit:
-            bpy.ops.object.mode_set(mode='OBJECT')
-
-        count = delete_unneeded_lines(obj)
-
-        if was_edit:
-            bpy.ops.object.mode_set(mode='EDIT')
-
-        self.report({'INFO'}, f"不要な線を{count}本削除しました")
-        return {'FINISHED'}
-
-
 def draw_roof_panel(layout, context):
     """屋根アドオンのパネル内容を描く(タブ統合パネルからも、単独パネルからも呼べる)。"""
     props = context.scene.roof_tool_props
@@ -954,16 +943,12 @@ def draw_roof_panel(layout, context):
         icon='TRIA_RIGHT' if props.dxf_section_collapsed else 'TRIA_DOWN', emboss=False,
     )
     if not props.dxf_section_collapsed:
-        box.prop(props, "dxf_arc_segments")
-        box.operator(ROOF_OT_scan_dxf_layers.bl_idname)
-        if props.dxf_layers:
+        box.operator(ROOF_OT_import_dxf_lines.bl_idname, icon='IMPORT')
+        if props.dxf_filepath:
             col = box.column(align=True)
             col.scale_y = 0.8
-            col.label(text="使うレイヤーにチェック(複数選択可):")
-            box.template_list(
-                "ROOF_UL_dxf_layers", "", props, "dxf_layers", props, "dxf_layers_index", rows=4,
-            )
-            box.operator(ROOF_OT_import_dxf_lines.bl_idname)
+            col.label(text=f"前回: {os.path.basename(props.dxf_filepath)}")
+            col.label(text=f"読み込み先: {props.dxf_target_name} / 分割数: {props.dxf_arc_segments}")
     else:
         box.label(text="読み込み済み(クリックで再表示)")
 
@@ -983,9 +968,9 @@ def draw_roof_panel(layout, context):
     op.edge_type = EDGE_TYPE_RIDGE
     op = col.operator(ROOF_OT_mark_edge_type.bl_idname, text="屋根の線として設定")
     op.edge_type = EDGE_TYPE_ROOF_LINE
-    op = col.operator(ROOF_OT_mark_edge_type.bl_idname, text="リセット(不要に戻す)")
+    op = col.operator(ROOF_OT_mark_edge_type.bl_idname, text="リセット")
     op.edge_type = EDGE_TYPE_NONE
-    op = col.operator(ROOF_OT_mark_edge_type.bl_idname, text="軒梁中心線に設定")
+    op = col.operator(ROOF_OT_mark_edge_type.bl_idname, text="軒梁中心線に設定（任意）")
     op.edge_type = EDGE_TYPE_HEIGHT_REF
 
     leg = box.column(align=True)
@@ -998,7 +983,7 @@ def draw_roof_panel(layout, context):
     leg2.label(text="1本のみ設定してください")
 
     box = layout.box()
-    box.label(text="4. 線のオフセット（不安定）", icon='MOD_OFFSET')
+    box.label(text="4. 線のオフセット", icon='MOD_OFFSET')
     box.prop(props, "offset_distance")
     box.operator(ROOF_OT_offset_edges.bl_idname, text="選択辺をオフセット")
     col = box.column(align=True)
@@ -1010,22 +995,18 @@ def draw_roof_panel(layout, context):
     col.label(text="屋根面(野地板面)を小さくしておくのがおすすめ")
 
     box = layout.box()
-    box.label(text="5. 不要な線を整理", icon='TRASH')
-    box.operator(ROOF_OT_delete_unneeded_lines.bl_idname)
-
-    box = layout.box()
-    box.label(text="6. 勾配", icon='DRIVER_ROTATIONAL_DIFFERENCE')
+    box.label(text="5. 勾配", icon='DRIVER_ROTATIONAL_DIFFERENCE')
     row = box.row(align=True)
     row.prop(props, "slope_ratio", text="(x/10)")
     row.prop(props, "slope_angle", text="(角度°)")
 
     box = layout.box()
-    box.label(text="7. 厚み", icon='MOD_SOLIDIFY')
+    box.label(text="6. 厚み", icon='MOD_SOLIDIFY')
     box.prop(props, "roof_thickness")
     box.prop(props, "roof_extrude_direction")
 
     box = layout.box()
-    box.label(text="8. 屋根面を生成", icon='MESH_DATA')
+    box.label(text="7. 屋根面を生成", icon='MESH_DATA')
     box.operator(ROOF_OT_generate_roof.bl_idname)
 
 
@@ -1250,12 +1231,10 @@ classes = (
     DXFLayerItem,
     RoofToolProps,
     ROOF_UL_dxf_layers,
-    ROOF_OT_scan_dxf_layers,
     ROOF_OT_import_dxf_lines,
     ROOF_OT_auto_detect,
     ROOF_OT_offset_edges,
     ROOF_OT_mark_edge_type,
-    ROOF_OT_delete_unneeded_lines,
     ROOF_OT_generate_roof,
     ROOF_OT_set_height_reference,
 )

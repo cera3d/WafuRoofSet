@@ -22,6 +22,8 @@ Blender用アドオン。CADの2D図面(DXF)から屋根面(野地板面)を自�
 
 自分で瓦セットを作る場合は [`docs/kawaraset_guide.md`](docs/kawaraset_guide.md) を参照してください。原点の決め方・寸法の関係など、セット作成時に必要なルールをまとめています。
 
+購入した瓦セット(zip)をアドオンに追加する方法は [`docs/kawaraset_add_guide.md`](docs/kawaraset_add_guide.md) を参照してください。
+
 屋根面作成(DXF取込)の使い方は [`docs/roofdxf_guide.md`](docs/roofdxf_guide.md) を参照してください。
 
 ## インストール
