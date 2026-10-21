@@ -28,9 +28,14 @@ Blender用アドオン。CADの2D図面(DXF)から屋根面(野地板面)を自�
 
 ## インストール
 
-1. Blender 5.1で動作確認済み(それ以外のバージョンでの動作は未確認です)
-2. 2. [Releases](https://github.com/cera3d/WafuRoofSet/releases) から WafuRoofSet_x.x.x.zip をダウンロード（解凍しない）
-3. Blenderの拡張機能(Extensions)/アドオン管理画面から、ダウンロードしたZIPをインストール
+1. Blender 5.1 / 5.2 で動作確認済み(それ以外のバージョンでの動作は未確認です)
+2. [Releases](https://github.com/cera3d/WafuRoofSet/releases) から、お使いのOS用の zip をダウンロード(解凍しない)
+   - Windows: `WafuRoofSet-x.x.x-windows_x64.zip`
+   - Mac(Apple Silicon): `WafuRoofSet-x.x.x-macos_arm64.zip` / Mac(Intel): `WafuRoofSet-x.x.x-macos_x64.zip`
+   - Linux: `WafuRoofSet-x.x.x-linux_x64.zip`
+3. Blenderの「編集 → プリファレンス → 機能拡張を入手 → 右上の ▼ → ディスクからインストール」で zip を選ぶ
+
+※ 緑の「Code」ボタンの「Download ZIP」で落としたものは、そのままではインストールできません(DXF読み込み用のライブラリも入っていません)。
 
 ## 既知の制限
 

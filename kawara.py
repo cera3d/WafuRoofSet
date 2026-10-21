@@ -46,6 +46,18 @@ class KawaraPatternSpec(bpy.types.PropertyGroup):
         description="平瓦を1段おきに半ピッチ(働き幅の半分)ずらして千鳥状に敷く。"
                      "ずれてケラバからはみ出た分は、後で「はみ出た平瓦をカット」で切り落とす前提",
     )
+    teisyaku_zurashi: BoolProperty(
+        name="定尺ずらし", default=False,
+        description="板金など定尺の平材を、段を追うごとに「ずらし寸法」分だけ累積的に"
+                     "ずらして張る(働き幅を超えたら自動で折り返す)。3段以上の周期で目地が"
+                     "重ならないようにする、定尺サイディング・板金でよくある張り方。"
+                     "千鳥敷きとは同時に使わない想定(両方ONの場合は千鳥が優先される)。"
+                     "ずれてケラバからはみ出た分は、後で「はみ出た平瓦をカット」で切り落とす前提",
+    )
+    zurashi_sunpo: FloatProperty(
+        name="ずらし寸法 (mm)", default=100.0, min=0.0, precision=0,
+        description="定尺ずらしで、段を1つ進むごとに横方向へ累積的にずらす距離(mm)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -72,16 +84,26 @@ def find_role_objects(col):
     """コレクション内のオブジェクトを役割ごとに検索する。
     各オブジェクトのカスタムプロパティ "kawara_role" が設定されていればそれを優先する
     (言語に依存しない、確実な判定方法)。
-    設定されていない場合のみ、従来通り名前(日本語/英語)から判定する
-    (「隅棟」は「棟」を含むため、hip の判定を ridge より先に行う)。
+    明示タグを持つオブジェクトを全て先に確定させてから、タグの無いオブジェクトだけ
+    名前(日本語/英語)でフォールバック判定する(2パス方式)。
+    1パスで処理すると、例えば「棟R」のようなタグ無しのミラー用ヘルパーオブジェクト
+    (名前に「棟」を含むだけ)が、コレクション内の並び順次第では本来の明示タグ付き
+    オブジェクトより先に走査されてしまい、フォールバック判定がridge役を先に確保して
+    しまう不具合が起きる(「隅棟」は「棟」を含むため、hip の判定を ridge より先に行う)。
     """
     found = {}
+
+    # 1パス目: 明示的な kawara_role タグを持つオブジェクトを最優先で確定させる
+    untagged = []
     for obj in col.objects:
         role = obj.get("kawara_role")
         if role in VALID_KAWARA_ROLES:
             found.setdefault(role, obj)
-            continue
+        else:
+            untagged.append(obj)
 
+    # 2パス目: タグの無いオブジェクトだけ、まだ埋まっていない役割を名前から推測する
+    for obj in untagged:
         name_lower = obj.name.lower()
         if "隅棟" in obj.name or "hip" in name_lower:
             found.setdefault("hip", obj)
@@ -435,7 +457,8 @@ def _get_or_create_kawara_collection(reference_obj):
     parent_col = parent_collections[0] if parent_collections else bpy.context.scene.collection
 
     for child in parent_col.children:
-        if child.name == "瓦":
+        # リンク(ライブラリ)のコレクションには追加できないので、ローカルの「瓦」だけを使う
+        if child.name == "瓦" and child.library is None and child.override_library is None:
             return child
 
     new_col = bpy.data.collections.new("瓦")
@@ -464,6 +487,17 @@ def _make_point_cloud(name, points, collection=None):
     return obj
 
 
+def _set_modifier_input(mod, identifier, value):
+    """ジオメトリノードのモディファイアの入力値を設定する。
+    Blender 5.2 からは mod[identifier] では書けず、mod.properties.inputs.<identifier>.value を使う"""
+    props = getattr(mod, "properties", None)
+    inputs = getattr(props, "inputs", None) if props is not None else None
+    if inputs is not None and hasattr(inputs, identifier):
+        getattr(inputs, identifier).value = value
+    else:
+        mod[identifier] = value
+
+
 def _instance_on_points(pts_obj, tile_obj, euler):
     ng = _get_or_create_instance_node_group()
 
@@ -490,10 +524,10 @@ def _instance_on_points(pts_obj, tile_obj, euler):
         elif item.name == "Random Seed" and item.item_type == 'SOCKET':
             seed_id = item.identifier
     if rot_id:
-        mod[rot_id] = (euler.x, euler.y, euler.z)
+        _set_modifier_input(mod, rot_id, (euler.x, euler.y, euler.z))
     if seed_id:
         scene = bpy.context.scene
-        mod[seed_id] = scene.kawara_tool_props.random_seed if hasattr(scene, "kawara_tool_props") else 0
+        _set_modifier_input(mod, seed_id, scene.kawara_tool_props.random_seed if hasattr(scene, "kawara_tool_props") else 0)
 
     pts_obj.data.update()
     return mod
@@ -648,9 +682,13 @@ def lay_flat_tiles(face_obj, col):
         poly_check_hip = poly.buffer(pitch_x) if not (left_is_boundary and right_is_boundary) else None
 
         chidori = bool(getattr(spec, "chidori", False))
-        # 千鳥敷きの場合、ずらした行は境界の外側(半ピッチ分)まで格子点が要るため、
-        # 探索範囲を1列分余分に広げておく。
-        i_margin = 2 if chidori else 1
+        teisyaku_zurashi = bool(getattr(spec, "teisyaku_zurashi", False))
+        zurashi_sunpo = (getattr(spec, "zurashi_sunpo", 0.0) or 0.0) / 1000.0  # mm -> m
+        # 千鳥敷き・定尺ずらしのどちらも「段によって横位置がずれる」という点は共通なので、
+        # 境界の扱い(はみ出し許容・探索マージン)はまとめて irregular_shift で判定する。
+        irregular_shift = chidori or teisyaku_zurashi
+        # ずらした行は境界の外側まで格子点が要るため、探索範囲を1列分余分に広げておく。
+        i_margin = 2 if irregular_shift else 1
         i_start = math.floor((u_min - kerava_overhang) / pitch_x) - i_margin
         i_end = math.ceil((u_max + kerava_overhang) / pitch_x) + i_margin
         j_start = math.floor((w_min - eave_overhang) / pitch_y) - 1
@@ -664,15 +702,23 @@ def lay_flat_tiles(face_obj, col):
         candidates = []
         for j in range(j_start, j_end + 1):
             # 千鳥敷き: 偶数段だけ半ピッチ分マイナス側(ケラバの外側)にずらす。
-            # はみ出た分は境界チェックでは弾かず、後の「はみ出た平瓦をカット」で
+            # 定尺ずらし: 段が進むごとに「ずらし寸法」分だけ累積的にずらし、働き幅を
+            # 超えたら折り返す(モジュロ)。板金の定尺張りでよくある、目地が何段も
+            # 重ならないようにする方式。
+            # どちらも、はみ出た分は境界チェックでは弾かず、後の「はみ出た平瓦をカット」で
             # ケラバの実際の輪郭に合わせて切り落とす前提。
-            # 軒に一番近い行(j=0相当)は基準通り、その次の行から半ピッチずつ交互にずらす
-            row_shift = (pitch_x / 2.0) if (chidori and j % 2 == 1) else 0.0
+            # 軒に一番近い行(j=0相当)は基準通り、その次の行からずらす
+            if chidori:
+                row_shift = (pitch_x / 2.0) if (j % 2 == 1) else 0.0
+            elif teisyaku_zurashi and zurashi_sunpo > 1e-9:
+                row_shift = (j * zurashi_sunpo) % pitch_x
+            else:
+                row_shift = 0.0
             row_has_point = False
             for i in range(i_start, i_end + 1):
                 u = left_offset - row_shift + i * pitch_x
                 w = j * pitch_y
-                if not chidori:
+                if not irregular_shift:
                     # 袖瓦(敷くタイプ)が確保している範囲(左端・右端のオフセット分)には、
                     # 平瓦の格子点を置かない
                     # 左右の上限・下限は、その辺が実際にケラバ(境界)である場合にのみ適用する。
@@ -692,15 +738,21 @@ def lay_flat_tiles(face_obj, col):
                     if right_is_boundary and i > n_x - 1:
                         continue
                 else:
-                    # 千鳥のずれた行は、境界を半ピッチ分はみ出すところまで許容する
-                    # (n_xによる上限チェックも行わない。はみ出しはカット工程に任せる)。
+                    # 千鳥・定尺ずらしでずれた行は、境界を1ピッチ分はみ出すところまで
+                    # 許容する(n_xによる上限チェックも行わない。はみ出しはカット工程に任せる)。
                     if left_is_boundary and u < left_offset - pitch_x - 1e-6:
                         continue
                     if right_is_boundary and u > right_bound + pitch_x + 1e-6:
                         continue
                 point = Point(u, w)
                 accept = poly_check.contains(point)
-                if not accept and poly_check_hip is not None and not chidori:
+                if not accept and irregular_shift and row_shift != 0.0:
+                    # 千鳥・定尺ずらしでは、実際にずらして置く候補点でも、「ずらしていなければ」
+                    # その行の通常の格子点として有効だったかどうかで判定する。
+                    # (横方向だけの話なので、判定バッファ自体を広げる必要は無い)
+                    unshifted_point = Point(u + row_shift, w)
+                    accept = poly_check.contains(unshifted_point)
+                if not accept and poly_check_hip is not None and not irregular_shift:
                     # ケラバでない辺の外側(通常の判定だと弾かれる範囲)に限って、
                     # より広いバッファ(1ピッチ分)で再判定する。
                     beyond_left = (not left_is_boundary) and u < left_offset - 1e-6
@@ -1463,7 +1515,7 @@ def lay_line_tiles(line_obj, tile_obj, pitch, reverse=False):
         effective_coords, start_type, end_type = _compute_effective_ridge_coords(line_obj, coords, col, pitch)
 
         suffix = _coords_ref_suffix(coords)
-        created, count = _lay_tiles_along_coords(effective_coords, tile_obj, pitch, f"{line_obj.name}_{suffix}_kawara", collection=kawara_col)
+        created, count = _lay_tiles_along_coords(effective_coords, tile_obj, pitch, f"{line_obj.name}_{suffix}_kawara_ridge", collection=kawara_col)
         for o in created:
             o["kawara_pitch_mm"] = pitch * 1000.0
             _set_parent_keep_transform(o, line_obj)
@@ -1804,6 +1856,9 @@ def refresh_spec_from_collection_props(col, context=None):
     # 千鳥がそのまま引き継がれてしまう。敷き方そのものを切り替える値なので、
     # 明示的な指定が無ければ必ずFalse(通常敷き)に戻す。
     working_spec.chidori = bool(col.get("kawara_chidori", False))
+    # 定尺ずらしも千鳥と同じ理由(敷き方そのものを切り替える値)で、
+    # 明示的な指定が無ければ必ずFalse(通常敷き)に戻す。
+    working_spec.teisyaku_zurashi = bool(col.get("kawara_teisyaku_zurashi", False))
 
     mapping = {
         "kawara_hataraki_haba": "hataraki_haba",
@@ -1813,6 +1868,7 @@ def refresh_spec_from_collection_props(col, context=None):
         "kawara_chousei_sunpo": "chousei_sunpo",
         "kawara_eave_overhang_mm": "eave_overhang",
         "kawara_kerava_overhang_mm": "kerava_overhang",
+        "kawara_zurashi_sunpo_mm": "zurashi_sunpo",
     }
     for prop_key, spec_field in mapping.items():
         if prop_key in col:
@@ -1946,7 +2002,7 @@ def _apply_seed_to_existing_tiles(context):
             for mod in obj.modifiers:
                 if mod.type == 'NODES' and mod.node_group is not None and mod.node_group.name.startswith("KawaraTileLay"):
                     try:
-                        mod[seed_id] = props.random_seed
+                        _set_modifier_input(mod, seed_id, props.random_seed)
                         touched = True
                         updated += 1
                     except Exception:
@@ -1992,6 +2048,8 @@ class KAWARA_OT_make_tile_materials_local(bpy.types.Operator):
         target_objs = []
         for col in bpy.data.collections:
             if col.name != "瓦" and not col.name.startswith("瓦."):
+                continue
+            if col.library is not None:   # リンクの「瓦」コレクション(瓦セットのファイル由来)は対象外
                 continue
             target_objs.extend(col.all_objects)
 
@@ -2504,6 +2562,16 @@ def draw_kawara_panel(layout, context):
         colf.prop(spec, "mune_pitch")
         colf.prop(spec, "sumi_mune_pitch")
         colf.prop(spec, "chousei_sunpo")
+        colf = box.column(align=True)
+        colf.prop(spec, "eave_overhang")
+        colf.prop(spec, "kerava_overhang")
+        # 敷き方(コレクションのカスタムプロパティから読み込んだ値を、ここで変更できる)
+        colf = box.column(align=True)
+        colf.prop(spec, "chidori")
+        colf.prop(spec, "teisyaku_zurashi")
+        sub = colf.row()
+        sub.enabled = spec.teisyaku_zurashi and not spec.chidori
+        sub.prop(spec, "zurashi_sunpo")
 
         box = layout.box()
         box.label(text="2. 対象を選んで配置", icon='MOD_ARRAY')
